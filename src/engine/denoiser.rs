@@ -5,20 +5,20 @@ pub struct Denoiser {
     enc_session: Session,
     erb_session: Session,
     df_session: Session,
-    states: Vec<f32>, 
+    states: Vec<f32>,
 }
 
 impl Denoiser {
     pub fn new(_sample_rate: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        let enc_session = Session::builder()?.commit_from_file("enc.onnx")?;
-        let erb_session = Session::builder()?.commit_from_file("erb_dec.onnx")?;
-        let df_session = Session::builder()?.commit_from_file("df_dec.onnx")?;
+        let enc_session = Session::builder()?.commit_from_file("models/enc.onnx")?;
+        let erb_session = Session::builder()?.commit_from_file("models/erb_dec.onnx")?;
+        let df_session = Session::builder()?.commit_from_file("models/df_dec.onnx")?;
 
         Ok(Self {
             enc_session,
             erb_session,
             df_session,
-            states: vec![0.0; 256], 
+            states: vec![0.0; 256],
         })
     }
 
@@ -33,16 +33,14 @@ impl Denoiser {
 
         if let Ok(enc_outs) = self.enc_session.run(enc_inputs) {
             if let Some(latent) = enc_outs.get("latent") {
-
                 // 2. PASSO: ERB DECODER - Removido .unwrap() do final do macro
                 let erb_inputs = ort::inputs![
                     "latent" => latent,
                     "states" => Value::from_array(([1usize, 1usize, 256usize], self.states.clone())).unwrap()
                 ];
-                
+
                 if let Ok(erb_outs) = self.erb_session.run(erb_inputs) {
                     if let Some(erb_val) = erb_outs.get("erb") {
-
                         // 3. PASSO: DF DECODER - Removido .unwrap() do final do macro
                         let df_inputs = ort::inputs![
                             "latent" => latent,
@@ -53,9 +51,11 @@ impl Denoiser {
                             if let Some(out_value) = df_outs.get("output") {
                                 let prob_tensor = out_value.try_extract_tensor::<f32>().unwrap();
                                 let clean_data = prob_tensor.1;
-                                
+
                                 for (i, &clean_sample) in clean_data.iter().enumerate() {
-                                    if i < buffer.len() { buffer[i] = clean_sample; }
+                                    if i < buffer.len() {
+                                        buffer[i] = clean_sample;
+                                    }
                                 }
                             }
                         }
@@ -66,6 +66,6 @@ impl Denoiser {
     }
 
     pub fn frame_size(&self) -> usize {
-        480 
+        480
     }
 }

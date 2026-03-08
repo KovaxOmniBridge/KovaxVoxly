@@ -22,12 +22,15 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let mut df_buffer = Vec::with_capacity(df_size);
 
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    let (tx_whisper, mut rx_whisper) = tokio::sync::mpsc::unbounded_channel::<(usize, Vec<f32>)>();
+    // Novo Canal: ID do locutor, IS_FINAL, Áudio f32
+    let (tx_whisper, mut rx_whisper) =
+        tokio::sync::mpsc::unbounded_channel::<(usize, bool, Vec<f32>)>();
 
     // --- THREAD DE INTELIGÊNCIA ---
     thread::spawn(move || {
-        let mut vad = engine::Vad::new("silero_vad.onnx").expect("Erro VAD");
-        let mut diarizer = engine::Diarizer::new("segmentation-3.0.onnx").expect("Erro Diarizer");
+        let mut vad = engine::Vad::new("models/silero_vad.onnx").expect("Erro VAD");
+        let mut diarizer =
+            engine::Diarizer::new("models/segmentation-3.0.onnx").expect("Erro Diarizer");
 
         let mut pre_roll = engine::buffers::PreRollBuffer::new(8000);
         let mut recording_buffer = Vec::new();
@@ -35,11 +38,11 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         let mut silence_frames = 0;
         let mut current_speaker = 0;
         let mut last_diarization_len = 0;
+        let mut last_partial_len = 0; // Para despachar transcrição parcial a cada X ms
 
         // Sensibilidade e limites de flush para não depender apenas de silêncio
-        // (evita ficar sem enviar nada ao Whisper quando o VAD não encerra frase).
         let vad_speech_threshold = 0.05f32;
-        let max_chunk_samples = 16000usize * 8usize; // Reduzido para ~8s para forçar fluidez
+        let max_chunk_samples = 16000usize * 8usize; // Limite longo fixo
 
         println!("[IA] Motores ativos. Fale no microfone...");
 
@@ -58,22 +61,28 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 silence_frames = 0;
 
                 // OTIMIZAÇÃO DE CPU: Rodar a diarização a cada ~1 segundo de áudio acumulado (16000 samples)
-                // em vez de rodar a cada 32ms (512 samples).
                 if recording_buffer.len() >= last_diarization_len + 16000 {
                     current_speaker = diarizer.identify(&recording_buffer);
                     last_diarization_len = recording_buffer.len();
                 }
 
-                // Flush forçado por tamanho para garantir envio ao Whisper mesmo
-                // quando não há silêncio suficiente para "fechar frase" no VAD.
+                // FASE 3 (STREAMING ASR): Disparar Pacotes Parciais a cada ~1.0 segundo (16000 samples).
+                // Isso cria o efeito "Palavras Mágicas flutuantes" na interface (is_final = false).
+                if recording_buffer.len() >= last_partial_len + 16000 {
+                    let _ = tx_whisper.send((current_speaker, false, recording_buffer.clone()));
+                    last_partial_len = recording_buffer.len();
+                }
+
+                // Flush forçado absoluto (Segurança Limite de Memória e Demora)
                 if recording_buffer.len() >= max_chunk_samples {
                     println!(
-                        "\n\x1b[36m[WHISPER]\x1b[0m Flush parcial por duração (~{:.1}s)",
+                        "\n\x1b[36m[WHISPER]\x1b[0m Flush absoluto por duração limite (~{:.1}s)",
                         recording_buffer.len() as f32 / 16000.0
                     );
-                    let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
+                    let _ = tx_whisper.send((current_speaker, true, recording_buffer.clone())); // Força como FINAL
                     recording_buffer.clear();
                     last_diarization_len = 0;
+                    last_partial_len = 0;
                     vad.reset_states();
                     diarizer.reset_history();
                 }
@@ -130,19 +139,17 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 // Usa 20 quadros de silêncio para não "cortar" palavras como T-estando
                 // antes da pessoa terminar de emitir o som da consoante inicial.
                 if silence_frames > 20 {
-                    // Só envia para a Inteligência Artificial se tiver mais de 1 segundo
-                    // (Evita spam de "0.10s" e "<vazio>" que causa congelamento do log e CPU).
+                    // CORTA O ÁUDIO E DECLARA FRASE FINAL (is_final = true)
                     if recording_buffer.len() > 16000 {
                         println!(
-                            "\n\x1b[32m[✓]\x1b[0m Frase finalizada. Limpando memória contextual..."
+                            "\n\x1b[32m[✓]\x1b[0m Silêncio Detectado. Fechando frase e acionando NLLB Trnslator..."
                         );
-                        let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
-                    } else {
-                        // Foi um micro-disparo de ruído inútil detectado, então limpamos em silêncio.
+                        let _ = tx_whisper.send((current_speaker, true, recording_buffer.clone()));
                     }
 
                     recording_buffer.clear();
                     last_diarization_len = 0;
+                    last_partial_len = 0;
                     is_recording = false;
 
                     // Reseta os estados preditivos para a próxima frase não sofrer vazamento
@@ -174,9 +181,12 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            while let Some((speaker_id, audio_data)) = rx_whisper.recv().await {
+            while let Some((speaker_id, is_final, audio_data)) = rx_whisper.recv().await {
+                // FASE 3: Envelopar (is_final || bytes_de_f32) em um único pacote WebSocket
+                let mut byte_data: Vec<u8> = vec![if is_final { 1 } else { 0 }];
+
                 // Converte o Vec<f32> em puro byte stream (Little Endian)
-                let byte_data: Vec<u8> = audio_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+                byte_data.extend(audio_data.iter().flat_map(|&f| f.to_le_bytes()));
 
                 if let Err(e) = stream
                     .send(Message::Binary(bytes::Bytes::from(byte_data)))
