@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import re
 import subprocess
@@ -7,10 +8,32 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import scrolledtext
 
-ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_voxly_root() -> Path:
+    env_root = os.environ.get("VOXLY_ROOT")
+    if env_root:
+        p = Path(env_root).resolve()
+        if (p / "Cargo.toml").exists():
+            return p
+
+    here = Path(__file__).resolve().parent
+    if (here / "Cargo.toml").exists():
+        return here
+
+    cwd = Path.cwd().resolve()
+    if (cwd / "Cargo.toml").exists():
+        return cwd
+
+    return here
+
+
+ROOT = _resolve_voxly_root()
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
 TRANSCRIPT_LOG = ROOT / "transcricoes_voxly.log"
+TRANSCRIPTION_FEED = ROOT / "transcricoes_feed.json"
+
 
 TRANSCRIPTION_REGEX = re.compile(r"Locutor\s*(\d+)\]\s*(.+)$", re.IGNORECASE)
 PYTHON_TRANSCRIPTION_REGEX = re.compile(r"\[TRANSCRIÇÃO\]\s*\([^)]*\)\s*->\s*'(.+)'$", re.IGNORECASE)
@@ -30,6 +53,7 @@ class VoxlyLauncherUI:
         self.events: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self.running = False
         self._received_transcription = False
+        self._feed_last_event_id = 0
 
         self.status_var = tk.StringVar(value="Pronto para iniciar")
         self._build_ui()
@@ -84,6 +108,8 @@ class VoxlyLauncherUI:
 
         self.running = True
         self._received_transcription = False
+        self._feed_last_event_id = 0
+        self._set_transcription_placeholder("Inicializando pipeline...")
         self._set_transcription_placeholder("Inicializando pipeline...")
         self.transcription_text.config(state=tk.NORMAL)
         self.transcription_text.delete("1.0", tk.END)
@@ -98,9 +124,13 @@ class VoxlyLauncherUI:
 
     def _start_pipeline(self) -> None:
         try:
+            env = os.environ.copy()
+            env["VOXLY_ROOT"] = str(ROOT)
+
             self.python_proc = subprocess.Popen(
                 [str(VENV_PYTHON), "-u", str(TRANSCRIBER)],
                 cwd=ROOT,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -182,6 +212,11 @@ class VoxlyLauncherUI:
 
     def _persist_transcript_line(self, line: str) -> None:
         try:
+            TRANSCRIPT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with TRANSCRIPT_LOG.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            self._set_status(f"Falha ao gravar log local: {exc}", ok=False)
             with TRANSCRIPT_LOG.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
         except OSError:
@@ -218,9 +253,48 @@ class VoxlyLauncherUI:
             self._received_transcription = True
         self._append(self.transcription_text, f"[sistema] {text}\n")
         self.transcription_text.config(state=tk.DISABLED)
+        self._persist_transcript_line(line)
+
+    def _append_transcription_system(self, text: str) -> None:
+        self.transcription_text.config(state=tk.NORMAL)
+        if not self._received_transcription:
+            self.transcription_text.delete("1.0", tk.END)
+            self._received_transcription = True
+        line = f"[sistema] {text}"
+        self._append(self.transcription_text, f"{line}\n")
+        self.transcription_text.config(state=tk.DISABLED)
+        self._persist_transcript_line(line)
 
     def _set_status(self, text: str, ok: bool) -> None:
         self.status_var.set(text)
+
+    def _drain_transcription_feed(self) -> None:
+        if not TRANSCRIPTION_FEED.exists():
+            return
+
+        try:
+            payload = json.loads(TRANSCRIPTION_FEED.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+
+        events = payload.get("events", [])
+        for event in events:
+            event_id = event.get("id")
+            if not isinstance(event_id, int) or event_id <= self._feed_last_event_id:
+                continue
+
+            status = event.get("status", "")
+            text = str(event.get("text", "")).strip()
+            error = str(event.get("error", "")).strip()
+
+            if status == "success" and text:
+                self._append_transcription("json", text)
+            elif status == "empty":
+                self._append_transcription_system("Sem fala detectada neste trecho (json feed).")
+            elif status == "error":
+                self._append_transcription_system(f"Erro no ASR (json feed): {error or 'desconhecido'}")
+
+            self._feed_last_event_id = event_id
 
     def _drain_events(self) -> None:
         while True:
@@ -268,6 +342,7 @@ class VoxlyLauncherUI:
             elif target == "status_error":
                 self._set_status(payload, ok=False)
 
+        self._drain_transcription_feed()
         self.root.after(120, self._drain_events)
 
     def on_close(self) -> None:
