@@ -88,7 +88,7 @@ class VoxlyLauncherUI:
     def _start_pipeline(self) -> None:
         try:
             self.python_proc = subprocess.Popen(
-                [str(VENV_PYTHON), str(TRANSCRIBER)],
+                [str(VENV_PYTHON), "-u", str(TRANSCRIBER)],
                 cwd=ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
