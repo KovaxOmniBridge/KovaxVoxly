@@ -31,6 +31,11 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         let mut silence_frames = 0;
         let mut current_speaker = 0;
 
+        // Sensibilidade e limites de flush para não depender apenas de silêncio
+        // (evita ficar sem enviar nada ao Whisper quando o VAD não encerra frase).
+        let vad_speech_threshold = 0.20f32;
+        let max_chunk_samples = 16000usize * 12usize; // ~12s em 16kHz
+
         println!("[IA] Motores ativos. Fale no microfone...");
 
         while let Ok(samples) = rx.recv() {
@@ -38,8 +43,8 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
             let probability = vad.is_speech(samples.clone());
 
-            // Ajuste de Sensibilidade: 0.30 é ideal para microfones comuns
-            if probability > 0.30 {
+            // Sensibilidade mais permissiva para evitar perda de fala em microfones comuns
+            if probability > vad_speech_threshold {
                 if !is_recording {
                     is_recording = true;
                     pre_roll.drain_to(&mut recording_buffer);
@@ -48,6 +53,20 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 silence_frames = 0;
 
                 current_speaker = diarizer.identify(&recording_buffer);
+
+                // Flush forçado por tamanho para garantir envio ao Whisper mesmo
+                // quando não há silêncio suficiente para "fechar frase" no VAD.
+                if recording_buffer.len() >= max_chunk_samples {
+                    println!(
+                        "\n\x1b[36m[WHISPER]\x1b[0m Flush parcial por duração (~{:.1}s)",
+                        recording_buffer.len() as f32 / 16000.0
+                    );
+                    let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
+                    recording_buffer.clear();
+                    vad.reset_states();
+                    diarizer.reset_history();
+                }
+
                 let bars = (probability * 20.0) as usize;
                 let bar_str = "█".repeat(bars);
                 let space_str = " ".repeat(20 - bars);
