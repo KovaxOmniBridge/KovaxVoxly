@@ -1,10 +1,9 @@
-use crate::engine; 
+use crate::engine;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use std::io;
 use std::sync::mpsc;
 use std::thread;
-use std::collections::VecDeque;
 
 pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -19,71 +18,166 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let mut df_buffer = Vec::with_capacity(df_size);
 
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    let (tx_whisper, mut rx_whisper) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+    let (tx_whisper, mut rx_whisper) = tokio::sync::mpsc::unbounded_channel::<(usize, Vec<f32>)>();
 
     // --- THREAD DE INTELIGÊNCIA ---
     thread::spawn(move || {
         let mut vad = engine::Vad::new("silero_vad.onnx").expect("Erro VAD");
         let mut diarizer = engine::Diarizer::new("segmentation-3.0.onnx").expect("Erro Diarizer");
 
-        let mut pre_roll = VecDeque::with_capacity(8000); 
+        let mut pre_roll = engine::buffers::PreRollBuffer::new(8000);
         let mut recording_buffer = Vec::new();
         let mut is_recording = false;
         let mut silence_frames = 0;
+        let mut current_speaker = 0;
 
         println!("[IA] Motores ativos. Fale no microfone...");
 
         while let Ok(samples) = rx.recv() {
-            for &s in &samples {
-                if pre_roll.len() >= 8000 { pre_roll.pop_front(); }
-                pre_roll.push_back(s);
-            }
+            pre_roll.push_samples(&samples);
 
             let probability = vad.is_speech(samples.clone());
 
             // Ajuste de Sensibilidade: 0.30 é ideal para microfones comuns
-            if probability > 0.30 { 
+            if probability > 0.30 {
                 if !is_recording {
                     is_recording = true;
-                    recording_buffer.extend(pre_roll.iter());
+                    pre_roll.drain_to(&mut recording_buffer);
                 }
                 recording_buffer.extend(samples);
                 silence_frames = 0;
 
-                let speaker_id = diarizer.identify(&recording_buffer);
-                print!("\r[!] VOZ DETECTADA: Locutor {} | Prob: {:.0}% | Gravando: {:.1}s    ", 
-                    speaker_id, probability * 100.0, recording_buffer.len() as f32 / 16000.0);
-                use std::io::Write; let _ = std::io::stdout().flush();
+                current_speaker = diarizer.identify(&recording_buffer);
+                let bars = (probability * 20.0) as usize;
+                let bar_str = "█".repeat(bars);
+                let space_str = " ".repeat(20 - bars);
+
+                use crossterm::{
+                    cursor, execute,
+                    style::{Color, Print, ResetColor, SetForegroundColor},
+                    terminal,
+                };
+                let _ = execute!(
+                    std::io::stdout(),
+                    cursor::MoveToColumn(0),
+                    terminal::Clear(terminal::ClearType::UntilNewLine),
+                    SetForegroundColor(Color::Green),
+                    Print("[VAD] "),
+                    ResetColor,
+                    Print(format!(
+                        "[{}{}] {:.0}% | Locutor ",
+                        bar_str,
+                        space_str,
+                        probability * 100.0
+                    )),
+                    SetForegroundColor(Color::Cyan),
+                    Print(format!("{}", current_speaker)),
+                    ResetColor,
+                    Print(format!(
+                        " | {:.1}s",
+                        recording_buffer.len() as f32 / 16000.0
+                    ))
+                );
             } else if is_recording {
                 recording_buffer.extend(samples);
                 silence_frames += 1;
 
-                if silence_frames > 30 { 
-                    println!("\n[✓] Frase finalizada. Enviando para Whisper...");
-                    let _ = tx_whisper.send(recording_buffer.clone());
+                use crossterm::{
+                    cursor, execute,
+                    style::{Color, Print, ResetColor, SetForegroundColor},
+                    terminal,
+                };
+                let _ = execute!(
+                    std::io::stdout(),
+                    cursor::MoveToColumn(0),
+                    terminal::Clear(terminal::ClearType::UntilNewLine),
+                    SetForegroundColor(Color::Yellow),
+                    Print("[VAD] "),
+                    ResetColor,
+                    Print(format!("Analisando silêncio... ({} / 30)", silence_frames))
+                );
+
+                if silence_frames > 30 {
+                    println!(
+                        "\n\x1b[32m[✓]\x1b[0m Frase finalizada. Limpando memória contextual..."
+                    );
+                    let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
                     recording_buffer.clear();
                     is_recording = false;
+
+                    // Reseta os estados preditivos para a próxima frase não sofrer vazamento
+                    vad.reset_states();
+                    diarizer.reset_history();
                 }
             }
         }
     });
 
     tokio::spawn(async move {
-        while let Some(audio_data) = rx_whisper.recv().await {
-            println!("[WHISPER] Processando {} bytes de áudio...", audio_data.len() * 4);
+        // Tenta conectar ao microserviço Python de Transcrição
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
+        println!("[WHISPER] Aguardando serviço Python local (127.0.0.1:8000)...");
+
+        let mut stream = loop {
+            match connect_async("ws://127.0.0.1:8000").await {
+                Ok((stream, _)) => {
+                    println!("\x1b[32m[✓]\x1b[0m Conectado ao Whisper Python WS!");
+                    break stream;
+                }
+                Err(_) => {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
+        };
+
+        while let Some((speaker_id, audio_data)) = rx_whisper.recv().await {
+            // Converte o Vec<f32> em puro byte stream (Little Endian)
+            let byte_data: Vec<u8> = audio_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+
+            if let Err(e) = stream
+                .send(Message::Binary(bytes::Bytes::from(byte_data)))
+                .await
+            {
+                eprintln!("[WHISPER] Erro ao jogar áudio na rede: {}", e);
+                break; // Cortar conexão se cair
+            }
+
+            // Aguarda silenciosamente a resposta do Python em JSON
+            if let Some(msg) = stream.next().await {
+                match msg {
+                    Ok(Message::Text(txt)) => {
+                        // Imprimir o texto transladado vindo do Python
+                        println!(
+                            "\n\x1b[35m[TRANSCRIÇÃO -> Locutor {}]\x1b[0m {}",
+                            speaker_id, txt
+                        );
+                    }
+                    Err(e) => eprintln!("Erro ao decodificar resposta do Whisper: {}", e),
+                    _ => {}
+                }
+            }
         }
     });
 
     let rb = HeapRb::<f32>::new(native_sr as usize * 2);
     let (mut prod, mut cons) = rb.split();
-    
+
     let mut chunk_collector = Vec::with_capacity(512);
     let sample_step = native_sr as f32 / 16000.0;
     let mut current_pos = 0.0f32;
+    let mut _debug_frames_captured = 0;
 
     let input_stream = mic.build_input_stream(
         &config,
         move |data: &[f32], _| {
+            _debug_frames_captured += 1;
+            if _debug_frames_captured % 100 == 0 {
+                // Imprime a cada ~1-2 segundos apenas para provar que a thread sobreviveu
+                // println!("[DEBUG] Capturados {} blocos do microfone", _debug_frames_captured);
+            }
+
             for &s in data {
                 df_buffer.push(s);
 
@@ -92,10 +186,9 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     denoiser.process_frame(&mut df_buffer);
 
                     for &clean_s in &df_buffer {
-                        let _ = prod.push(clean_s); 
+                        let _ = prod.push(clean_s);
 
                         // 2. Coleta para a IA (Resampling simplificado)
-                        // Se native_sr é 48000, pegamos 1 a cada 3 samples para dar 16000
                         current_pos += 1.0;
                         if current_pos >= sample_step {
                             chunk_collector.push(clean_s);
@@ -103,7 +196,9 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
                             if chunk_collector.len() >= 512 {
                                 // FORÇAR ENVIO: O Rio agora deságua na IA
-                                let _ = tx.send(chunk_collector.clone());
+                                if let Err(e) = tx.send(chunk_collector.clone()) {
+                                    eprintln!("Erro ao enviar chunk para IA: {}", e);
+                                }
                                 chunk_collector.clear();
                             }
                         }
@@ -112,20 +207,19 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
-
         |e| eprintln!("Erro Mic: {}", e),
-        None
+        None,
     )?;
-
 
     let output_stream = out.build_output_stream(
         &config,
         move |data: &mut [f32], _| {
-            for s in data.iter_mut() { *s = cons.pop().unwrap_or(0.0); }
+            for s in data.iter_mut() {
+                *s = cons.pop().unwrap_or(0.0);
+            }
         },
-
         |e| eprintln!("Erro Saída: {}", e),
-        None
+        None,
     )?;
 
     input_stream.play()?;

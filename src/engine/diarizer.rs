@@ -8,21 +8,23 @@ pub struct Diarizer {
 
 impl Diarizer {
     pub fn new(model_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let session = Session::builder()?
-            .commit_from_file(model_path)?;
-        
-        Ok(Self { session, history: Vec::new() })
+        let session = Session::builder()?.commit_from_file(model_path)?;
+
+        Ok(Self {
+            session,
+            history: Vec::new(),
+        })
     }
 
     pub fn identify(&mut self, chunk: &[f32]) -> usize {
         self.history.extend_from_slice(chunk);
-        
+
         if self.history.len() < 8000 {
             return 0;
         }
 
         if self.history.len() > 16000 * 5 {
-            self.history.drain(0..16000); 
+            self.history.drain(0..16000);
         }
 
         let input_shape = [1, 1, self.history.len()];
@@ -42,7 +44,7 @@ impl Diarizer {
             }
         }
 
-        speaker_id 
+        speaker_id
     }
 
     // Transformada em função associada (estática) para não precisar de &self
@@ -55,9 +57,13 @@ impl Diarizer {
         for (i, &val) in data.iter().enumerate() {
             if val > max_val {
                 max_val = val;
-                speaker_id = i % 7; 
+                speaker_id = i % 7;
             }
         }
         speaker_id
+    }
+
+    pub fn reset_history(&mut self) {
+        self.history.clear();
     }
 }

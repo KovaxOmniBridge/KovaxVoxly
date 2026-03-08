@@ -27,3 +27,6 @@ deep_filter = "0.2"
 winreg = "0.11"
 hound = "3.5.1"
 crossterm = "0.29.0"
+futures-util = { version = "0.3.32", features = ["sink"] }
+tokio-tungstenite = "0.28.0"
+bytes = "1.11.1"
