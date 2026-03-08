@@ -85,6 +85,10 @@ class VoxlyLauncherUI:
         self.running = True
         self._received_transcription = False
         self._set_transcription_placeholder("Inicializando pipeline...")
+        self.transcription_text.config(state=tk.NORMAL)
+        self.transcription_text.delete("1.0", tk.END)
+        self.transcription_text.insert(tk.END, "Inicializando pipeline...\n")
+        self.transcription_text.config(state=tk.DISABLED)
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self._set_status("Iniciando serviço Python...", ok=True)
@@ -206,6 +210,14 @@ class VoxlyLauncherUI:
         self._append(self.transcription_text, f"{line}\n")
         self.transcription_text.config(state=tk.DISABLED)
         self._persist_transcript_line(line)
+
+    def _append_transcription_system(self, text: str) -> None:
+        self.transcription_text.config(state=tk.NORMAL)
+        if not self._received_transcription:
+            self.transcription_text.delete("1.0", tk.END)
+            self._received_transcription = True
+        self._append(self.transcription_text, f"[sistema] {text}\n")
+        self.transcription_text.config(state=tk.DISABLED)
 
     def _set_status(self, text: str, ok: bool) -> None:
         self.status_var.set(text)
