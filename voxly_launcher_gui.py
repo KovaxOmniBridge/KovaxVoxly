@@ -13,6 +13,9 @@ TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
 TRANSCRIPT_LOG = ROOT / "transcricoes_voxly.log"
 TRANSCRIPTION_FEED = ROOT / "transcricoes_feed.json"
 
+
+TRANSCRIPTION_REGEX = re.compile(r"Locutor\s*(\d+)\]\s*(.+)$", re.IGNORECASE)
+PYTHON_TRANSCRIPTION_REGEX = re.compile(r"\[TRANSCRIÇÃO\]\s*\([^)]*\)\s*->\s*'(.+)'$", re.IGNORECASE)
 ANSI_ESCAPE_REGEX = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 RUST_READY_REGEX = re.compile(r"\[IA\].*Motores ativos", re.IGNORECASE)
 
@@ -86,6 +89,11 @@ class VoxlyLauncherUI:
         self._received_transcription = False
         self._feed_last_event_id = 0
         self._set_transcription_placeholder("Inicializando pipeline...")
+        self._set_transcription_placeholder("Inicializando pipeline...")
+        self.transcription_text.config(state=tk.NORMAL)
+        self.transcription_text.delete("1.0", tk.END)
+        self.transcription_text.insert(tk.END, "Inicializando pipeline...\n")
+        self.transcription_text.config(state=tk.DISABLED)
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self._set_status("Iniciando serviço Python...", ok=True)
@@ -208,6 +216,15 @@ class VoxlyLauncherUI:
         self.transcription_text.config(state=tk.DISABLED)
         self._persist_transcript_line(line)
 
+    def _append_transcription_system(self, text: str) -> None:
+        self.transcription_text.config(state=tk.NORMAL)
+        if not self._received_transcription:
+            self.transcription_text.delete("1.0", tk.END)
+            self._received_transcription = True
+        self._append(self.transcription_text, f"[sistema] {text}\n")
+        self.transcription_text.config(state=tk.DISABLED)
+        self._persist_transcript_line(line)
+
     def _set_status(self, text: str, ok: bool) -> None:
         self.status_var.set(text)
 
@@ -248,12 +265,38 @@ class VoxlyLauncherUI:
 
             if target == "python":
                 self._append(self.python_logs, payload)
+                clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
+                py_match = PYTHON_TRANSCRIPTION_REGEX.search(clean_payload)
+                if py_match:
+                    text = py_match.group(1).strip()
+                    if text:
+                        self._append_transcription("?", text)
             elif target == "rust":
                 self._append(self.rust_logs, payload)
                 clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
 
                 if not self._received_transcription and RUST_READY_REGEX.search(clean_payload):
                     self._set_transcription_placeholder("Pipeline pronto. Aguardando fala no microfone...")
+
+                match = TRANSCRIPTION_REGEX.search(clean_payload)
+                if match:
+                    speaker, text = match.groups()
+                    text = text.strip()
+                    if text.startswith("{"):
+                        try:
+                            data = json.loads(text)
+                            text = data.get("text", text)
+                            status = data.get("status")
+                            if status == "error":
+                                self.events.put(("status_error", f"ASR retornou erro: {data.get('error', 'desconhecido')}"))
+                                self._append_transcription_system(f"Erro no ASR: {data.get('error', 'desconhecido')}")
+                            elif status == "empty":
+                                self.events.put(("status", "ASR sem fala detectada neste trecho."))
+                                self._append_transcription_system("Sem fala detectada neste trecho.")
+                        except json.JSONDecodeError:
+                            pass
+                    if text:
+                        self._append_transcription(speaker, text)
             elif target == "status":
                 self._set_status(payload, ok=True)
             elif target == "status_error":
