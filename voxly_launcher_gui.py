@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
 
-TRANSCRIPTION_REGEX = re.compile(r"\[TRANSCRIÇÃO -> Locutor\s*(\d+)\]\s*(.+)$")
+TRANSCRIPTION_REGEX = re.compile(r"Locutor\s*(\d+)\]\s*(.+)$", re.IGNORECASE)
 ANSI_ESCAPE_REGEX = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
@@ -26,6 +26,7 @@ class VoxlyLauncherUI:
         self.rust_proc: subprocess.Popen | None = None
         self.events: "queue.Queue[tuple[str, str]]" = queue.Queue()
         self.running = False
+        self._received_transcription = False
 
         self.status_var = tk.StringVar(value="Pronto para iniciar")
         self._build_ui()
@@ -79,6 +80,7 @@ class VoxlyLauncherUI:
             return
 
         self.running = True
+        self._received_transcription = False
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self._set_status("Iniciando serviço Python...", ok=True)
@@ -153,6 +155,7 @@ class VoxlyLauncherUI:
         self.python_proc = None
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+        self._received_transcription = False
         self._set_status("Processos parados.", ok=False)
 
     def _terminate(self, proc: subprocess.Popen | None) -> None:
@@ -169,6 +172,9 @@ class VoxlyLauncherUI:
 
     def _append_transcription(self, speaker: str, text: str) -> None:
         self.transcription_text.config(state=tk.NORMAL)
+        if not self._received_transcription:
+            self.transcription_text.delete("1.0", tk.END)
+            self._received_transcription = True
         self._append(self.transcription_text, f"Locutor {speaker}: {text}\n")
         self.transcription_text.config(state=tk.DISABLED)
 
@@ -186,17 +192,24 @@ class VoxlyLauncherUI:
                 self._append(self.python_logs, payload)
             elif target == "rust":
                 self._append(self.rust_logs, payload)
-                clean_payload = ANSI_ESCAPE_REGEX.sub("", payload)
+                clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
                 match = TRANSCRIPTION_REGEX.search(clean_payload)
                 if match:
                     speaker, text = match.groups()
+                    text = text.strip()
                     if text.startswith("{"):
                         try:
                             data = json.loads(text)
                             text = data.get("text", text)
+                            status = data.get("status")
+                            if status == "error":
+                                self.events.put(("status_error", f"ASR retornou erro: {data.get('error', 'desconhecido')}"))
+                            elif status == "empty":
+                                self.events.put(("status", "ASR sem fala detectada neste trecho."))
                         except json.JSONDecodeError:
                             pass
-                    self._append_transcription(speaker, text)
+                    if text:
+                        self._append_transcription(speaker, text)
             elif target == "status":
                 self._set_status(payload, ok=True)
             elif target == "status_error":
