@@ -12,6 +12,7 @@ VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
 
 TRANSCRIPTION_REGEX = re.compile(r"\[TRANSCRIÇÃO -> Locutor\s*(\d+)\]\s*(.+)$")
+ANSI_ESCAPE_REGEX = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 class VoxlyLauncherUI:
@@ -185,7 +186,8 @@ class VoxlyLauncherUI:
                 self._append(self.python_logs, payload)
             elif target == "rust":
                 self._append(self.rust_logs, payload)
-                match = TRANSCRIPTION_REGEX.search(payload)
+                clean_payload = ANSI_ESCAPE_REGEX.sub("", payload)
+                match = TRANSCRIPTION_REGEX.search(clean_payload)
                 if match:
                     speaker, text = match.groups()
                     if text.startswith("{"):
