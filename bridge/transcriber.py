@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import multiprocessing
 import struct
 import time
 from datetime import datetime, timezone
@@ -9,13 +10,17 @@ from pathlib import Path
 import numpy as np
 import websockets
 from faster_whisper import WhisperModel
+import ctranslate2
+from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
 
 # --- CONFIGURAÇÃO ---
 PORT = 8000
-MODEL_SIZE = "base" # Changed from small for even lower latency on CPU
+MODEL_SIZE = "small" # Changed back exactly to 'small' to improve phonetic accuracy (voz vs avó)
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 MAX_FEED_EVENTS = 500
+CORES = max(multiprocessing.cpu_count() - 1, 2)
 
 
 def _resolve_voxly_root() -> Path:
@@ -38,6 +43,7 @@ def _resolve_voxly_root() -> Path:
 
 ROOT = _resolve_voxly_root()
 TRANSCRIPTION_FEED = ROOT / "transcricoes_feed.json"
+VOXLY_CONFIG = ROOT / "voxly_config.json"
 
 _feed_state = {"next_id": 1, "events": []}
 
@@ -60,7 +66,7 @@ def _reset_feed_file() -> None:
     _flush_feed_file()
 
 
-def _append_feed_event(status: str, *, text: str = "", error: str = "", elapsed_s: float | None = None, num_samples: int | None = None) -> None:
+def _append_feed_event(status: str, *, text: str = "", error: str = "", elapsed_s: float | None = None, num_samples: int | None = None, traduction: str = "", time_traduction: float | None = None) -> None:
     event = {
         "id": _feed_state["next_id"],
         "ts": _utc_now(),
@@ -71,6 +77,10 @@ def _append_feed_event(status: str, *, text: str = "", error: str = "", elapsed_
         "elapsed_s": elapsed_s,
         "num_samples": num_samples,
     }
+    if traduction or time_traduction is not None:
+        event["traduction"] = traduction
+        event["time_traduction"] = time_traduction
+
     _feed_state["next_id"] += 1
     _feed_state["events"].append(event)
     if len(_feed_state["events"]) > MAX_FEED_EVENTS:
@@ -79,9 +89,21 @@ def _append_feed_event(status: str, *, text: str = "", error: str = "", elapsed_
 
 
 print(f"[*] Voxly root resolvido em: {ROOT}", flush=True)
-print(f"[*] Carregando Whisper ({MODEL_SIZE}) em {DEVICE}...", flush=True)
-model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-print(f"[+] Modelo carregado na memória!", flush=True)
+
+print(f"[*] Carregando Tradutor NLLB-200 em {DEVICE} (Pode demorar no primeiro uso para download)...", flush=True)
+model_path = snapshot_download("entai2965/nllb-200-distilled-600M-ctranslate2")
+translator_model = ctranslate2.Translator(
+    model_path, 
+    device=DEVICE, 
+    compute_type=COMPUTE_TYPE,
+    inter_threads=2,
+    intra_threads=CORES
+)
+tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
+
+print(f"[*] Carregando Whisper ({MODEL_SIZE}) com {CORES} threads de CPU...", flush=True)
+model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE, cpu_threads=CORES)
+print(f"[+] Modelos carregados na memória!", flush=True)
 
 
 async def process_audio(websocket):
@@ -111,7 +133,8 @@ async def process_audio(websocket):
                 audio_array = np.array(struct.unpack(f"<{num_samples}f", message), dtype=np.float32)
                 print(f"[RECEBEU] {num_samples} amostras ({len(message)} bytes). Transcrevendo...")
 
-                # OTIMIZAÇÃO: beam_size reduzido de 5 para 2. A busca gulosa (greedy) é muito mais rápida em CPU.
+                # OTIMIZAÇÃO: beam_size=2 com multi-threading pesado. Mantém fidelidade do 'small' 
+                # e reduz pela metade o tempo de pensamento e processamento vs beam_size=4.
                 segments, _info = model.transcribe(audio_array, language="pt", beam_size=2, vad_filter=True)
                 text_result = " ".join(segment.text for segment in segments).strip()
                 elapsed = round(time.time() - start_time, 2)
@@ -121,9 +144,59 @@ async def process_audio(websocket):
                     await websocket.send(json.dumps({"status": "empty", "text": "", "elapsed_s": elapsed}))
                     continue
 
-                print(f"[TRANSCRIÇÃO] ({elapsed:.2f}s) -> '{text_result}'")
-                _append_feed_event("success", text=text_result, elapsed_s=elapsed, num_samples=num_samples)
-                await websocket.send(json.dumps({"status": "success", "text": text_result, "elapsed_s": elapsed}))
+                # Configuração dinâmica de tradução
+                config = {"input_nllb": "por_Latn", "output_nllb": "eng_Latn"}
+                if VOXLY_CONFIG.exists():
+                    try:
+                        config.update(json.loads(VOXLY_CONFIG.read_text("utf-8")))
+                    except json.JSONDecodeError:
+                        pass
+                
+                traduction_result = ""
+                time_traduction = None
+
+                if config["input_nllb"] != config["output_nllb"]:
+                    start_trans = time.time()
+                    
+                    # NLLB requer que você avise em qual idioma a palavra está ANTES de tokenizar.
+                    tokenizer.src_lang = config["input_nllb"]
+                    source_tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text_result))
+                    target_prefix = [config["output_nllb"]]
+                    
+                    try:
+                        # OTIMIZAÇÃO: Ajuste balanceado de Beam Search (2) limitando CPU extra.
+                        results = translator_model.translate_batch(
+                            [source_tokens], 
+                            target_prefix=[target_prefix],
+                            beam_size=2,
+                            repetition_penalty=1.2,
+                            no_repeat_ngram_size=3
+                        )
+                        target_tokens = results[0].hypotheses[0][1:]
+                        traduction_result = tokenizer.decode(tokenizer.convert_tokens_to_ids(target_tokens))
+                        time_traduction = round(time.time() - start_trans, 2)
+                        print(f"[TRANSCRIÇÃO] ({elapsed:.2f}s) -> '{text_result}' | TRADUÇÃO ({time_traduction}s) -> '{traduction_result}'")
+                    except Exception as trans_err:
+                        print(f"[ERRO] Falha na tradução: {trans_err}")
+                else:
+                    print(f"[TRANSCRIÇÃO] ({elapsed:.2f}s) -> '{text_result}'")
+
+                _append_feed_event(
+                    "success", 
+                    text=text_result, 
+                    elapsed_s=elapsed, 
+                    num_samples=num_samples,
+                    traduction=traduction_result,
+                    time_traduction=time_traduction
+                )
+                
+                await websocket.send(json.dumps({
+                    "status": "success", 
+                    "text": text_result, 
+                    "elapsed_s": elapsed,
+                    "traduction": traduction_result,
+                    "time_traduction": time_traduction
+                }))
 
             except Exception as proc_err:
                 err = str(proc_err)

@@ -124,12 +124,12 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     SetForegroundColor(Color::Yellow),
                     Print("[VAD] "),
                     ResetColor,
-                    Print(format!("Analisando silêncio... ({} / 10)", silence_frames))
+                    Print(format!("Analisando silêncio... ({} / 20)", silence_frames))
                 );
 
-                // Usa menos quadros de silêncio (10 em vez de 15) para enviar o áudio
-                // mais rapidamente para a IA após a pessoa parar de falar.
-                if silence_frames > 10 {
+                // Usa 20 quadros de silêncio para não "cortar" palavras como T-estando
+                // antes da pessoa terminar de emitir o som da consoante inicial.
+                if silence_frames > 20 {
                     // Só envia para a Inteligência Artificial se tiver mais de 1 segundo
                     // (Evita spam de "0.10s" e "<vazio>" que causa congelamento do log e CPU).
                     if recording_buffer.len() > 16000 {

@@ -1,0 +1,6 @@
+{
+  "input_lang_name": "Português",
+  "output_lang_name": "Inglês",
+  "input_nllb": "por_Latn",
+  "output_nllb": "eng_Latn"
+}

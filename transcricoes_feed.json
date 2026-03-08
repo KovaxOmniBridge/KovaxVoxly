@@ -1,35 +1,77 @@
 {
-  "updated_at": "2026-03-08T17:59:43.593298+00:00",
+  "updated_at": "2026-03-08T21:32:36.210124+00:00",
   "events": [
     {
       "id": 1,
-      "ts": "2026-03-08T17:59:34.813580+00:00",
+      "ts": "2026-03-08T21:31:55.268878+00:00",
       "source": "faster-whisper",
       "status": "success",
-      "text": "Testando",
+      "text": "Mais um teste.",
       "error": "",
-      "elapsed_s": 1.16,
-      "num_samples": 31232
+      "elapsed_s": 3.69,
+      "num_samples": 36160,
+      "traduction": "One more test.",
+      "time_traduction": 0.38
     },
     {
       "id": 2,
-      "ts": "2026-03-08T17:59:39.824680+00:00",
+      "ts": "2026-03-08T21:32:04.938610+00:00",
       "source": "faster-whisper",
       "status": "success",
-      "text": "velocidade máxima",
+      "text": "Será que está lento ainda?",
       "error": "",
-      "elapsed_s": 0.91,
-      "num_samples": 37376
+      "elapsed_s": 3.39,
+      "num_samples": 38720,
+      "traduction": "Is he still slow?",
+      "time_traduction": 0.43
     },
     {
       "id": 3,
-      "ts": "2026-03-08T17:59:43.593298+00:00",
+      "ts": "2026-03-08T21:32:13.734684+00:00",
       "source": "faster-whisper",
       "status": "success",
-      "text": "Vamos lá!",
+      "text": "Parece que estão pouco lento ainda.",
       "error": "",
-      "elapsed_s": 0.85,
-      "num_samples": 28160
+      "elapsed_s": 3.88,
+      "num_samples": 42816,
+      "traduction": "Looks like they're a little slow yet.",
+      "time_traduction": 0.75
+    },
+    {
+      "id": 4,
+      "ts": "2026-03-08T21:32:21.838716+00:00",
+      "source": "faster-whisper",
+      "status": "success",
+      "text": "Por que será que lhe demora tanto pra pra...",
+      "error": "",
+      "elapsed_s": 4.04,
+      "num_samples": 31040,
+      "traduction": "Why is it taking you so long to...",
+      "time_traduction": 0.64
+    },
+    {
+      "id": 5,
+      "ts": "2026-03-08T21:32:27.995161+00:00",
+      "source": "faster-whisper",
+      "status": "success",
+      "text": "tanto para fazer essa minha fala.",
+      "error": "",
+      "elapsed_s": 5.59,
+      "num_samples": 34624,
+      "traduction": "So much for making my speech.",
+      "time_traduction": 0.55
+    },
+    {
+      "id": 6,
+      "ts": "2026-03-08T21:32:36.210124+00:00",
+      "source": "faster-whisper",
+      "status": "success",
+      "text": "Por que será que ele demora tanto para acessar a minha fala?",
+      "error": "",
+      "elapsed_s": 4.28,
+      "num_samples": 59712,
+      "traduction": "Why would he take so long to access my speech?",
+      "time_traduction": 0.79
     }
   ]
 }

@@ -6,7 +6,16 @@ import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import scrolledtext
+from tkinter import ttk, scrolledtext
+
+LANGMAP = {
+    "Português": "por_Latn",
+    "Inglês": "eng_Latn",
+    "Espanhol": "spa_Latn",
+    "Francês": "fra_Latn",
+    "Alemão": "deu_Latn",
+    "Italiano": "ita_Latn",
+}
 
 
 
@@ -33,6 +42,7 @@ VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
 TRANSCRIPT_LOG = ROOT / "transcricoes_voxly.log"
 TRANSCRIPTION_FEED = ROOT / "transcricoes_feed.json"
+VOXLY_CONFIG = ROOT / "voxly_config.json"
 
 
 TRANSCRIPTION_REGEX = re.compile(r"Locutor\s*(\d+)\]\s*(.+)$", re.IGNORECASE)
@@ -76,8 +86,25 @@ class VoxlyLauncherUI:
         status = tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="#0f5132", padx=12)
         status.pack(fill=tk.X)
 
-        center = tk.LabelFrame(self.root, text="Transcrição ASR (tempo real)", padx=8, pady=8)
+        center = tk.LabelFrame(self.root, text="Transcrição e Tradução (tempo real)", padx=8, pady=8)
         center.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8, 6))
+
+        lang_frame = tk.Frame(center)
+        lang_frame.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(lang_frame, text="Falar em (Entrada):", font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self.input_lang_combo = ttk.Combobox(lang_frame, values=list(LANGMAP.keys()), state="readonly", width=15)
+        self.input_lang_combo.set("Português")
+        self.input_lang_combo.pack(side=tk.LEFT, padx=(4, 20))
+        self.input_lang_combo.bind("<<ComboboxSelected>>", self._save_config)
+
+        tk.Label(lang_frame, text="Traduzir para (Saída):", font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        self.output_lang_combo = ttk.Combobox(lang_frame, values=list(LANGMAP.keys()), state="readonly", width=15)
+        self.output_lang_combo.set("Inglês")
+        self.output_lang_combo.pack(side=tk.LEFT, padx=(4, 20))
+        self.output_lang_combo.bind("<<ComboboxSelected>>", self._save_config)
+
+        self._save_config()
 
         self.transcription_text = scrolledtext.ScrolledText(center, height=14, wrap=tk.WORD, font=("Consolas", 12))
         self.transcription_text.pack(fill=tk.BOTH, expand=True)
@@ -98,6 +125,18 @@ class VoxlyLauncherUI:
 
         self.rust_logs = scrolledtext.ScrolledText(right_panel, wrap=tk.WORD, font=("Consolas", 10))
         self.rust_logs.pack(fill=tk.BOTH, expand=True)
+
+    def _save_config(self, event=None) -> None:
+        try:
+            config = {
+                "input_lang_name": self.input_lang_combo.get(),
+                "output_lang_name": self.output_lang_combo.get(),
+                "input_nllb": LANGMAP.get(self.input_lang_combo.get(), "por_Latn"),
+                "output_nllb": LANGMAP.get(self.output_lang_combo.get(), "eng_Latn"),
+            }
+            VOXLY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"Erro ao salvar config: {e}")
 
     def start_all(self) -> None:
         if self.running:
@@ -318,12 +357,16 @@ class VoxlyLauncherUI:
                         try:
                             data = json.loads(text)
                             text = data.get("text", text)
+                            trad = data.get("traduction", "")
                             status = data.get("status")
                             if status == "error":
                                 self.events.put(("status_error", f"ASR retornou erro: {data.get('error', 'desconhecido')}"))
                                 self._append_transcription_system(f"Erro no ASR: {data.get('error', 'desconhecido')}")
                             elif status == "empty":
                                 pass
+                            
+                            if trad:
+                                text = f"{text}\n  ↳ [Tradução]: {trad}"
                         except json.JSONDecodeError:
                             pass
                     if text:
