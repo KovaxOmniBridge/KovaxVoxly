@@ -1,0 +1,35 @@
+{
+  "updated_at": "2026-03-08T17:59:43.593298+00:00",
+  "events": [
+    {
+      "id": 1,
+      "ts": "2026-03-08T17:59:34.813580+00:00",
+      "source": "faster-whisper",
+      "status": "success",
+      "text": "Testando",
+      "error": "",
+      "elapsed_s": 1.16,
+      "num_samples": 31232
+    },
+    {
+      "id": 2,
+      "ts": "2026-03-08T17:59:39.824680+00:00",
+      "source": "faster-whisper",
+      "status": "success",
+      "text": "velocidade máxima",
+      "error": "",
+      "elapsed_s": 0.91,
+      "num_samples": 37376
+    },
+    {
+      "id": 3,
+      "ts": "2026-03-08T17:59:43.593298+00:00",
+      "source": "faster-whisper",
+      "status": "success",
+      "text": "Vamos lá!",
+      "error": "",
+      "elapsed_s": 0.85,
+      "num_samples": 28160
+    }
+  ]
+}

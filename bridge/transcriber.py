@@ -12,7 +12,7 @@ from faster_whisper import WhisperModel
 
 # --- CONFIGURAÇÃO ---
 PORT = 8000
-MODEL_SIZE = "large-v3-turbo"
+MODEL_SIZE = "base" # Changed from small for even lower latency on CPU
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 MAX_FEED_EVENTS = 500
@@ -111,13 +111,13 @@ async def process_audio(websocket):
                 audio_array = np.array(struct.unpack(f"<{num_samples}f", message), dtype=np.float32)
                 print(f"[RECEBEU] {num_samples} amostras ({len(message)} bytes). Transcrevendo...")
 
-                segments, _info = model.transcribe(audio_array, language="pt", beam_size=5, vad_filter=True)
+                # OTIMIZAÇÃO: beam_size reduzido de 5 para 2. A busca gulosa (greedy) é muito mais rápida em CPU.
+                segments, _info = model.transcribe(audio_array, language="pt", beam_size=2, vad_filter=True)
                 text_result = " ".join(segment.text for segment in segments).strip()
                 elapsed = round(time.time() - start_time, 2)
 
                 if not text_result:
                     print(f"[TRANSCRIÇÃO] ({elapsed:.2f}s) -> <vazio>")
-                    _append_feed_event("empty", text="", elapsed_s=elapsed, num_samples=num_samples)
                     await websocket.send(json.dumps({"status": "empty", "text": "", "elapsed_s": elapsed}))
                     continue
 

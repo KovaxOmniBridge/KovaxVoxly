@@ -12,6 +12,10 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
 
     let config: cpal::StreamConfig = mic.default_input_config()?.into();
     let native_sr = config.sample_rate.0;
+    let in_channels = config.channels as usize;
+
+    let out_config: cpal::StreamConfig = out.default_output_config()?.into();
+    let out_channels = out_config.channels as usize;
 
     let mut denoiser = engine::Denoiser::new(native_sr)?;
     let df_size = denoiser.frame_size();
@@ -30,11 +34,12 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         let mut is_recording = false;
         let mut silence_frames = 0;
         let mut current_speaker = 0;
+        let mut last_diarization_len = 0;
 
         // Sensibilidade e limites de flush para não depender apenas de silêncio
         // (evita ficar sem enviar nada ao Whisper quando o VAD não encerra frase).
-        let vad_speech_threshold = 0.20f32;
-        let max_chunk_samples = 16000usize * 12usize; // ~12s em 16kHz
+        let vad_speech_threshold = 0.05f32;
+        let max_chunk_samples = 16000usize * 8usize; // Reduzido para ~8s para forçar fluidez
 
         println!("[IA] Motores ativos. Fale no microfone...");
 
@@ -52,7 +57,12 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 recording_buffer.extend(samples);
                 silence_frames = 0;
 
-                current_speaker = diarizer.identify(&recording_buffer);
+                // OTIMIZAÇÃO DE CPU: Rodar a diarização a cada ~1 segundo de áudio acumulado (16000 samples)
+                // em vez de rodar a cada 32ms (512 samples).
+                if recording_buffer.len() >= last_diarization_len + 16000 {
+                    current_speaker = diarizer.identify(&recording_buffer);
+                    last_diarization_len = recording_buffer.len();
+                }
 
                 // Flush forçado por tamanho para garantir envio ao Whisper mesmo
                 // quando não há silêncio suficiente para "fechar frase" no VAD.
@@ -63,6 +73,7 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
                     recording_buffer.clear();
+                    last_diarization_len = 0;
                     vad.reset_states();
                     diarizer.reset_history();
                 }
@@ -113,15 +124,25 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     SetForegroundColor(Color::Yellow),
                     Print("[VAD] "),
                     ResetColor,
-                    Print(format!("Analisando silêncio... ({} / 30)", silence_frames))
+                    Print(format!("Analisando silêncio... ({} / 10)", silence_frames))
                 );
 
-                if silence_frames > 30 {
-                    println!(
-                        "\n\x1b[32m[✓]\x1b[0m Frase finalizada. Limpando memória contextual..."
-                    );
-                    let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
+                // Usa menos quadros de silêncio (10 em vez de 15) para enviar o áudio
+                // mais rapidamente para a IA após a pessoa parar de falar.
+                if silence_frames > 10 {
+                    // Só envia para a Inteligência Artificial se tiver mais de 1 segundo
+                    // (Evita spam de "0.10s" e "<vazio>" que causa congelamento do log e CPU).
+                    if recording_buffer.len() > 16000 {
+                        println!(
+                            "\n\x1b[32m[✓]\x1b[0m Frase finalizada. Limpando memória contextual..."
+                        );
+                        let _ = tx_whisper.send((current_speaker, recording_buffer.clone()));
+                    } else {
+                        // Foi um micro-disparo de ruído inútil detectado, então limpamos em silêncio.
+                    }
+
                     recording_buffer.clear();
+                    last_diarization_len = 0;
                     is_recording = false;
 
                     // Reseta os estados preditivos para a próxima frase não sofrer vazamento
@@ -225,15 +246,26 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
             _debug_frames_captured += 1;
             if _debug_frames_captured % 100 == 0 {
                 // Imprime a cada ~1-2 segundos apenas para provar que a thread sobreviveu
-                // println!("[DEBUG] Capturados {} blocos do microfone", _debug_frames_captured);
+                println!(
+                    "[DEBUG] Capturados {} blocos do microfone",
+                    _debug_frames_captured
+                );
             }
 
-            for &s in data {
-                df_buffer.push(s);
+            for frame in data.chunks(in_channels) {
+                let mono_s = frame[0]; // Pega apenas um canal (mono)
+                df_buffer.push(mono_s);
 
                 if df_buffer.len() >= df_size {
-                    // 1. Limpa o áudio (O que você ouve no fone)
-                    denoiser.process_frame(&mut df_buffer);
+                    // OTIMIZAÇÃO DE CPU: Ignorar o modelo de ruído se o quadro for de silêncio absoluto.
+                    // Isso poupa inferências ONNX custosas (100x por segundo) quando não há som.
+                    let max_amp = df_buffer.iter().copied().fold(0.0f32, f32::max);
+                    let min_amp = df_buffer.iter().copied().fold(0.0f32, f32::min);
+                    let is_silent = (max_amp - min_amp) < 0.005;
+
+                    if !is_silent {
+                        denoiser.process_frame(&mut df_buffer);
+                    }
 
                     for &clean_s in &df_buffer {
                         let _ = prod.push(clean_s);
@@ -242,7 +274,7 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                         current_pos += 1.0;
                         if current_pos >= sample_step {
                             chunk_collector.push(clean_s);
-                            current_pos = 0.0; // Reset simples
+                            current_pos -= sample_step; // Subtrai em vez de zerar
 
                             if chunk_collector.len() >= 512 {
                                 // FORÇAR ENVIO: O Rio agora deságua na IA
@@ -262,10 +294,13 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let output_stream = out.build_output_stream(
-        &config,
+        &out_config,
         move |data: &mut [f32], _| {
-            for s in data.iter_mut() {
-                *s = cons.pop().unwrap_or(0.0);
+            for frame in data.chunks_mut(out_channels) {
+                let val = cons.pop().unwrap_or(0.0);
+                for s in frame {
+                    *s = val;
+                }
             }
         },
         |e| eprintln!("Erro Saída: {}", e),

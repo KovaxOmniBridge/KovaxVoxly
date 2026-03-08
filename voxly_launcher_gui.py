@@ -54,6 +54,7 @@ class VoxlyLauncherUI:
         self.running = False
         self._received_transcription = False
         self._feed_last_event_id = 0
+        self._feed_last_mtime = 0.0
 
         self.status_var = tk.StringVar(value="Pronto para iniciar")
         self._build_ui()
@@ -246,55 +247,41 @@ class VoxlyLauncherUI:
         self.transcription_text.config(state=tk.DISABLED)
         self._persist_transcript_line(line)
 
-    def _append_transcription_system(self, text: str) -> None:
-        self.transcription_text.config(state=tk.NORMAL)
-        if not self._received_transcription:
-            self.transcription_text.delete("1.0", tk.END)
-            self._received_transcription = True
-        self._append(self.transcription_text, f"[sistema] {text}\n")
-        self.transcription_text.config(state=tk.DISABLED)
-        self._persist_transcript_line(line)
-
-    def _append_transcription_system(self, text: str) -> None:
-        self.transcription_text.config(state=tk.NORMAL)
-        if not self._received_transcription:
-            self.transcription_text.delete("1.0", tk.END)
-            self._received_transcription = True
-        line = f"[sistema] {text}"
-        self._append(self.transcription_text, f"{line}\n")
-        self.transcription_text.config(state=tk.DISABLED)
-        self._persist_transcript_line(line)
-
     def _set_status(self, text: str, ok: bool) -> None:
         self.status_var.set(text)
 
     def _drain_transcription_feed(self) -> None:
         if not TRANSCRIPTION_FEED.exists():
             return
-
+        
         try:
+            current_mtime = TRANSCRIPTION_FEED.stat().st_mtime
+            if current_mtime <= self._feed_last_mtime:
+                return
+            self._feed_last_mtime = current_mtime
+            
+            # Lê o JSON apenas se o arquivo foi modificado (extremamente leve, sem onerar a CPU)
             payload = json.loads(TRANSCRIPTION_FEED.read_text(encoding="utf-8"))
+            events = payload.get("events", [])
+            for event in events:
+                event_id = event.get("id")
+                if not isinstance(event_id, int) or event_id <= self._feed_last_event_id:
+                    continue
+
+                status = event.get("status", "")
+                text = str(event.get("text", "")).strip()
+                error = str(event.get("error", "")).strip()
+
+                if status == "success" and text:
+                    # Não vamos colocar na fila da interface para evitar prints duplicados
+                    # pois o Rust e o Python já imprimem no stdout nativamente.
+                    pass
+                elif status == "error":
+                    self.events.put(("json_system", f"Erro no ASR (json feed): {error or 'desconhecido'}"))
+
+                self._feed_last_event_id = event_id
         except (OSError, json.JSONDecodeError):
-            return
-
-        events = payload.get("events", [])
-        for event in events:
-            event_id = event.get("id")
-            if not isinstance(event_id, int) or event_id <= self._feed_last_event_id:
-                continue
-
-            status = event.get("status", "")
-            text = str(event.get("text", "")).strip()
-            error = str(event.get("error", "")).strip()
-
-            if status == "success" and text:
-                self._append_transcription("json", text)
-            elif status == "empty":
-                self._append_transcription_system("Sem fala detectada neste trecho (json feed).")
-            elif status == "error":
-                self._append_transcription_system(f"Erro no ASR (json feed): {error or 'desconhecido'}")
-
-            self._feed_last_event_id = event_id
+            pass
 
     def _drain_events(self) -> None:
         while True:
@@ -304,16 +291,21 @@ class VoxlyLauncherUI:
                 break
 
             if target == "python":
-                self._append(self.python_logs, payload)
                 clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
+                if clean_payload:
+                    self._append(self.python_logs, clean_payload + "\n")
+                
                 py_match = PYTHON_TRANSCRIPTION_REGEX.search(clean_payload)
                 if py_match:
                     text = py_match.group(1).strip()
                     if text:
                         self._append_transcription("?", text)
             elif target == "rust":
-                self._append(self.rust_logs, payload)
                 clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
+
+                # Ignora a massiva barra de progresso do terminal para impedir o congelamento do Tkinter
+                if "[VAD]" not in clean_payload and clean_payload:
+                    self._append(self.rust_logs, clean_payload + "\n")
 
                 if not self._received_transcription and RUST_READY_REGEX.search(clean_payload):
                     self._set_transcription_placeholder("Pipeline pronto. Aguardando fala no microfone...")
@@ -331,8 +323,7 @@ class VoxlyLauncherUI:
                                 self.events.put(("status_error", f"ASR retornou erro: {data.get('error', 'desconhecido')}"))
                                 self._append_transcription_system(f"Erro no ASR: {data.get('error', 'desconhecido')}")
                             elif status == "empty":
-                                self.events.put(("status", "ASR sem fala detectada neste trecho."))
-                                self._append_transcription_system("Sem fala detectada neste trecho.")
+                                pass
                         except json.JSONDecodeError:
                             pass
                     if text:
@@ -341,9 +332,13 @@ class VoxlyLauncherUI:
                 self._set_status(payload, ok=True)
             elif target == "status_error":
                 self._set_status(payload, ok=False)
+            elif target == "json_transcription":
+                self._append_transcription("json", payload)
+            elif target == "json_system":
+                self._append_transcription_system(payload)
 
         self._drain_transcription_feed()
-        self.root.after(120, self._drain_events)
+        self.root.after(200, self._drain_events)
 
     def on_close(self) -> None:
         self.stop_all()
