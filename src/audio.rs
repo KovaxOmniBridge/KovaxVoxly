@@ -1,9 +1,9 @@
 use crate::engine;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
-use std::io;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -226,6 +226,14 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     output_stream.play()?;
 
     println!("\n[VIVO] Voxly: {}Hz nativos.", native_sr);
-    io::stdin().read_line(&mut String::new())?;
+
+    // Mantém os streams vivos enquanto o processo estiver rodando.
+    // Evita depender de stdin, que pode estar fechado quando o app é
+    // iniciado por launchers GUI (causando encerramento imediato).
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    #[allow(unreachable_code)]
     Ok(())
 }
