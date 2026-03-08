@@ -150,22 +150,38 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     continue 'whisper_bridge;
                 }
 
-                // Aguarda silenciosamente a resposta do Python em JSON
-                match stream.next().await {
-                    Some(Ok(Message::Text(txt))) => {
+                // Aguarda resposta do Python em JSON, com timeout para não travar
+                // indefinidamente caso o servidor fique preso em inferência.
+                match tokio::time::timeout(tokio::time::Duration::from_secs(45), stream.next())
+                    .await
+                {
+                    Ok(Some(Ok(Message::Text(txt)))) => {
                         println!(
                             "\n\x1b[35m[TRANSCRIÇÃO -> Locutor {}]\x1b[0m {}",
                             speaker_id, txt
                         );
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => {
+                    Ok(Some(Ok(Message::Close(frame)))) => {
+                        eprintln!(
+                            "[WHISPER] Servidor encerrou conexão ({:?}). Reconectando...",
+                            frame
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue 'whisper_bridge;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(e))) => {
                         eprintln!("[WHISPER] Erro na resposta: {}. Tentando reconectar...", e);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue 'whisper_bridge;
                     }
-                    None => {
+                    Ok(None) => {
                         eprintln!("[WHISPER] Conexão encerrada pelo servidor. Reconectando...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue 'whisper_bridge;
+                    }
+                    Err(_) => {
+                        eprintln!("[WHISPER] Timeout aguardando transcrição. Reconectando...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue 'whisper_bridge;
                     }
