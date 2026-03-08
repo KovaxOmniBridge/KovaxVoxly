@@ -14,9 +14,9 @@ MODEL_SIZE = "large-v3-turbo"
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 
-print(f"[*] Carregando Whisper ({MODEL_SIZE}) em {DEVICE}...")
+print(f"[*] Carregando Whisper ({MODEL_SIZE}) em {DEVICE}...", flush=True)
 model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-print(f"[+] Modelo carregado na memória!")
+print(f"[+] Modelo carregado na memória!", flush=True)
 
 async def process_audio(websocket):
     client_ip = websocket.remote_address[0]
@@ -65,7 +65,7 @@ async def process_audio(websocket):
         print(f"[ERRO] Falha no processamento: {e}")
 
 async def main():
-    print(f"[*] Iniciando servidor WebSocket Whisper local na porta {PORT}...")
+    print(f"[*] Iniciando servidor WebSocket Whisper local na porta {PORT}...", flush=True)
     async with websockets.serve(process_audio, "127.0.0.1", PORT):
         await asyncio.Future()  # Roda para sempre
 
