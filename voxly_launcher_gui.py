@@ -317,7 +317,7 @@ class VoxlyLauncherUI:
 
                 if not self._received_transcription and RUST_READY_REGEX.search(clean_payload):
                     self._set_transcription_placeholder("Pipeline pronto. Aguardando fala no microfone...")
-
+                    
                 match = TRANSCRIPTION_REGEX.search(clean_payload)
                 if match:
                     speaker, text = match.groups()
