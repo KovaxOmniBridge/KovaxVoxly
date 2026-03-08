@@ -1,7 +1,6 @@
 use crate::engine;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
-use std::io;
 use std::sync::mpsc;
 use std::thread;
 
@@ -114,50 +113,65 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     tokio::spawn(async move {
-        // Tenta conectar ao microserviço Python de Transcrição
+        // Tenta conectar ao microserviço Python de Transcrição.
+        // Se a conexão cair, reconecta automaticamente sem perder o loop de ASR.
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
         println!("[WHISPER] Aguardando serviço Python local (127.0.0.1:8000)...");
 
-        let mut stream = loop {
-            match connect_async("ws://127.0.0.1:8000").await {
-                Ok((stream, _)) => {
-                    println!("\x1b[32m[✓]\x1b[0m Conectado ao Whisper Python WS!");
-                    break stream;
+        'whisper_bridge: loop {
+            let mut stream = loop {
+                match connect_async("ws://127.0.0.1:8000").await {
+                    Ok((stream, _)) => {
+                        println!("\x1b[32m[✓]\x1b[0m Conectado ao Whisper Python WS!");
+                        break stream;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
                 }
-                Err(_) => {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            };
+
+            while let Some((speaker_id, audio_data)) = rx_whisper.recv().await {
+                // Converte o Vec<f32> em puro byte stream (Little Endian)
+                let byte_data: Vec<u8> = audio_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+
+                if let Err(e) = stream
+                    .send(Message::Binary(bytes::Bytes::from(byte_data)))
+                    .await
+                {
+                    eprintln!(
+                        "[WHISPER] Erro ao enviar áudio: {}. Tentando reconectar...",
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue 'whisper_bridge;
                 }
-            }
-        };
 
-        while let Some((speaker_id, audio_data)) = rx_whisper.recv().await {
-            // Converte o Vec<f32> em puro byte stream (Little Endian)
-            let byte_data: Vec<u8> = audio_data.iter().flat_map(|&f| f.to_le_bytes()).collect();
-
-            if let Err(e) = stream
-                .send(Message::Binary(bytes::Bytes::from(byte_data)))
-                .await
-            {
-                eprintln!("[WHISPER] Erro ao jogar áudio na rede: {}", e);
-                break; // Cortar conexão se cair
-            }
-
-            // Aguarda silenciosamente a resposta do Python em JSON
-            if let Some(msg) = stream.next().await {
-                match msg {
-                    Ok(Message::Text(txt)) => {
-                        // Imprimir o texto transladado vindo do Python
+                // Aguarda silenciosamente a resposta do Python em JSON
+                match stream.next().await {
+                    Some(Ok(Message::Text(txt))) => {
                         println!(
                             "\n\x1b[35m[TRANSCRIÇÃO -> Locutor {}]\x1b[0m {}",
                             speaker_id, txt
                         );
                     }
-                    Err(e) => eprintln!("Erro ao decodificar resposta do Whisper: {}", e),
-                    _ => {}
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        eprintln!("[WHISPER] Erro na resposta: {}. Tentando reconectar...", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue 'whisper_bridge;
+                    }
+                    None => {
+                        eprintln!("[WHISPER] Conexão encerrada pelo servidor. Reconectando...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue 'whisper_bridge;
+                    }
                 }
             }
+
+            break;
         }
     });
 
@@ -226,6 +240,11 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     output_stream.play()?;
 
     println!("\n[VIVO] Voxly: {}Hz nativos.", native_sr);
-    io::stdin().read_line(&mut String::new())?;
+
+    // Mantém os streams vivos sem depender de stdin.
+    // Isso evita encerramento prematuro quando iniciado por launchers GUI.
+    let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let _ = shutdown_rx.recv();
+
     Ok(())
 }
