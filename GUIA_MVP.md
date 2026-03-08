@@ -122,6 +122,23 @@ O aplicativo deve:
 3. conectar no WebSocket local do Python,
 4. mostrar status do VAD no terminal.
 
+## 3.1) Inicialização automática com interface (sem terminal manual)
+
+Para iniciar tudo com um clique no Windows, use o arquivo:
+
+```bash
+Iniciar_Voxly.bat
+```
+
+Ele abre uma interface gráfica (`voxly_launcher_gui.py`) que:
+- inicia automaticamente o `bridge/transcriber.py` no `.venv`,
+- aguarda o Whisper subir na porta `8000`,
+- executa `cargo run`,
+- exibe logs separados de Python e Rust,
+- mostra no painel central as transcrições ASR em tempo real.
+
+> Se o `.venv` não existir, o launcher mostra erro e orienta os comandos de setup.
+
 ## 4) Roteiro de teste do MVP (passo a passo)
 
 1. Com os dois processos rodando, fale frases curtas no microfone.
