@@ -3,6 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
@@ -246,5 +247,13 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
     let _ = shutdown_rx.recv();
 
+    // Mantém os streams vivos enquanto o processo estiver rodando.
+    // Evita depender de stdin, que pode estar fechado quando o app é
+    // iniciado por launchers GUI (causando encerramento imediato).
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    #[allow(unreachable_code)]
     Ok(())
 }
