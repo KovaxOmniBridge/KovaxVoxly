@@ -10,21 +10,13 @@ import time
 # --- CONFIGURAÇÃO ---
 PORT = 8000
 MODEL_SIZE = "large-v3-turbo"
-# Use 'cuda' e 'float16' se tiver GPU Nvidia potente, ou 'cpu' e 'int8'
-# Recomenda-se 'cuda' se tiver pelo menos 6GB de VRAM
-DEVICE = "cuda" 
-COMPUTE_TYPE = "float16"
+# Projeto configurado para CPU-only
+DEVICE = "cpu"
+COMPUTE_TYPE = "int8"
 
 print(f"[*] Carregando Whisper ({MODEL_SIZE}) em {DEVICE}...")
-try:
-    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-    print(f"[+] Modelo carregado na memória!")
-except Exception as e:
-    print(f"[!] Erro CUDA/Model! Tentando forçar modo CPU...")
-    DEVICE = "cpu"
-    COMPUTE_TYPE = "int8"
-    model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-    print(f"[+] Modelo recarregado em CPU!")
+model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+print(f"[+] Modelo carregado na memória!")
 
 async def process_audio(websocket):
     client_ip = websocket.remote_address[0]
