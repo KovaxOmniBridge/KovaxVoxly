@@ -43,6 +43,8 @@ TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
 TRANSCRIPT_LOG = ROOT / "data" / "transcricoes_voxly.log"
 TRANSCRIPTION_FEED = ROOT / "data" / "transcricoes_feed.json"
 VOXLY_CONFIG = ROOT / "voxly_config.json"
+PYTHON_LOG = ROOT / "data" / "python_last_run.log"
+RUST_LOG = ROOT / "data" / "rust_last_run.log"
 
 
 TRANSCRIPTION_REGEX = re.compile(r"Locutor\s*(\d+)\]\s*(.+)$", re.IGNORECASE)
@@ -191,6 +193,12 @@ class VoxlyLauncherUI:
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self._set_status("Iniciando serviço Python...", ok=True)
+        
+        PYTHON_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(PYTHON_LOG, "w", encoding="utf-8") as f:
+            f.write("=== Inicio do Log Python (TTS/ASR) ===\n")
+        with open(RUST_LOG, "w", encoding="utf-8") as f:
+            f.write("=== Inicio do Log Rust (Voxly Core) ===\n")
 
         thread = threading.Thread(target=self._start_pipeline, daemon=True)
         thread.start()
@@ -436,6 +444,8 @@ class VoxlyLauncherUI:
                 clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
                 if clean_payload:
                     self._append(self.python_logs, clean_payload + "\n")
+                    with open(PYTHON_LOG, "a", encoding="utf-8") as f:
+                        f.write(clean_payload + "\n")
                 
                 py_match = PYTHON_TRANSCRIPTION_REGEX.search(clean_payload)
                 if py_match:
@@ -448,6 +458,8 @@ class VoxlyLauncherUI:
                 # Ignora a massiva barra de progresso do terminal para impedir o congelamento do Tkinter
                 if "[VAD]" not in clean_payload and clean_payload:
                     self._append(self.rust_logs, clean_payload + "\n")
+                    with open(RUST_LOG, "a", encoding="utf-8") as f:
+                        f.write(clean_payload + "\n")
 
                 if not self._received_transcription and RUST_READY_REGEX.search(clean_payload):
                     self._set_transcription_placeholder("Pipeline pronto. Aguardando fala no microfone...")

@@ -11,8 +11,15 @@ import numpy as np
 import websockets
 from faster_whisper import WhisperModel
 import ctranslate2
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 from transformers import AutoTokenizer
+import queue
+import threading
+import sounddevice as sd
+import soundfile as sf
+import io
+import wave
+from piper.voice import PiperVoice
 
 # --- CONFIGURAÇÃO ---
 PORT = 8000
@@ -127,6 +134,91 @@ print(f"[+] Modelos carregados na memória!", flush=True)
 # Desacopla a Tradução (Lenta) da Transcrição (Rápida).
 translation_queue = asyncio.Queue()
 
+# Desacopla a Geração de Fala (TTS) da Tradução
+tts_queue = queue.Queue()
+
+global_outbound_queue = None
+main_loop = None
+
+def download_piper_model(lang_code):
+    PIPER_MODELS = {
+        "eng_Latn": ("en/en_US/lessac/medium/en_US-lessac-medium.onnx", "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"),
+        "spa_Latn": ("es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx", "es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx.json"),
+        "por_Latn": ("pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx", "pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json"),
+        "fra_Latn": ("fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx", "fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json"),
+        "deu_Latn": ("de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx", "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json"),
+        "ita_Latn": ("it/it_IT/paola/medium/it_IT-paola-medium.onnx", "it/it_IT/paola/medium/it_IT-paola-medium.onnx.json")
+    }
+    
+    if lang_code not in PIPER_MODELS:
+        print(f"[AVISO] Idioma {lang_code} não suportado pelo Piper localmente, usando Inglês.", flush=True)
+        lang_code = "eng_Latn"
+        
+    onnx_file, json_file = PIPER_MODELS[lang_code]
+    print(f"[*] Verificando/Baixando modelo Piper TTS para {lang_code}...", flush=True)
+    onnx_path = hf_hub_download(repo_id="rhasspy/piper-voices", filename=onnx_file)
+    json_path = hf_hub_download(repo_id="rhasspy/piper-voices", filename=json_file)
+    return onnx_path, json_path
+
+def tts_worker():
+    current_lang = None
+    voice = None
+
+    while True:
+        try:
+            job = tts_queue.get()
+            if job is None:
+                break
+                
+            text = job["text"]
+            lang_code = job["lang_code"]
+            
+            # Carrega/atualiza voz se o idioma mudou
+            if current_lang != lang_code or voice is None:
+                print(f"[TTS] Carregando voz Piper para {lang_code}...", flush=True)
+                onnx_path, json_path = download_piper_model(lang_code)
+                voice = PiperVoice.load(onnx_path, config_path=json_path)
+                current_lang = lang_code
+                print(f"[TTS] Voz carregada na memória!", flush=True)
+                
+            with open(json_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            sample_rate = cfg.get("audio", {}).get("sample_rate", 22050)
+                
+            # Gera audio diretamente em PCM float32 usando o gerador interno do Piper
+            start_tts = time.time()
+            
+            # synthesize() retorna um iterador de AudioChunks
+            audio_f32_chunks = []
+            for chunk in voice.synthesize(text):
+                # O chunk já fornece o array numpy f32 normalizado
+                audio_f32_chunks.append(chunk.audio_float_array)
+            
+            if not audio_f32_chunks:
+                print(f"[TTS] Aviso: Piper não gerou nenhum áudio para o texto '{text}'", flush=True)
+                tts_queue.task_done()
+                continue
+                
+            # Concatena todos os pedaços da frase em um único array f32 1D
+            audio_f32 = np.concatenate(audio_f32_chunks)
+            
+            print(f"[TTS] Áudio gerado ({time.time() - start_tts:.2f}s). {len(audio_f32)} amostras. Enviando PCM {sample_rate}Hz para o Rust...", flush=True)
+            
+            # Formato Binário: [0x02: u8] [SampleRate: u32_LE] [F32 PCM...]
+            header = struct.pack('<BI', 2, sample_rate)
+            msg = header + audio_f32.tobytes()
+            
+            if main_loop is not None and global_outbound_queue is not None:
+                main_loop.call_soon_threadsafe(global_outbound_queue.put_nowait, msg)
+            
+            tts_queue.task_done()
+        except Exception as e:
+            print(f"[ERRO] Worker de TTS falhou: {e}", flush=True)
+            try:
+                tts_queue.task_done()
+            except:
+                pass
+
 async def translation_worker():
     """Worker rodando perpetuamente em 2º plano aguardando frases para traduzir."""
     while True:
@@ -174,16 +266,24 @@ async def translation_worker():
             )
             
             # 4. Avisa a interface gráfica Tkinter para atualizar a tela
-            if websocket:
-                try:
-                    await websocket.send(json.dumps({
+            try:
+                if main_loop and global_outbound_queue:
+                    msg = json.dumps({
                         "status": "translation_update", 
                         "id": event_id,
                         "traduction": traduction_result,
                         "time_traduction": time_traduction
-                    }))
-                except Exception:
-                    pass
+                    })
+                    main_loop.call_soon_threadsafe(global_outbound_queue.put_nowait, msg)
+            except Exception:
+                pass
+            
+            # 5. Envia a tradução para o Worker de TTS para ser falada
+            if traduction_result:
+                tts_queue.put({
+                    "text": traduction_result,
+                    "lang_code": config["output_nllb"]
+                })
             
             translation_queue.task_done()
             
@@ -193,16 +293,31 @@ async def translation_worker():
             print(f"[ERRO] Worker de Tradução falhou: {e}")
 
 
+async def send_worker(websocket):
+    try:
+        while True:
+            if global_outbound_queue is None:
+                break
+            msg = await global_outbound_queue.get()
+            await websocket.send(msg)
+    except Exception as e:
+        print(f"[CONEXÃO] Erro no enviador WebSocket: {e}")
+
 async def process_audio(websocket):
+    global global_outbound_queue, main_loop
     client_ip = websocket.remote_address[0] if websocket.remote_address else "desconhecido"
     print(f"[CONEXÃO] Rust conectado de {client_ip}")
+    
+    main_loop = asyncio.get_running_loop()
+    global_outbound_queue = asyncio.Queue()
+    sender_task = asyncio.create_task(send_worker(websocket))
 
     try:
         async for message in websocket:
             if not isinstance(message, bytes) or len(message) < 1:
                 err = "tipo de payload inválido; esperado binário com cabeçalho"
                 _append_feed_event("error", error=err)
-                await websocket.send(json.dumps({"status": "error", "error": err}))
+                global_outbound_queue.put_nowait(json.dumps({"status": "error", "error": err}))
                 continue
 
             try:
@@ -245,12 +360,12 @@ async def process_audio(websocket):
 
                 if not text_result:
                     if is_final:
-                        await websocket.send(json.dumps({"status": "empty", "text": "", "elapsed_s": elapsed}))
+                        global_outbound_queue.put_nowait(json.dumps({"status": "empty", "text": "", "elapsed_s": elapsed}))
                     continue
                 
                 # Se for apenas um vislumbre em tempo real, envia pra interface e descarta.
                 if not is_final:
-                    await websocket.send(json.dumps({
+                    global_outbound_queue.put_nowait(json.dumps({
                         "status": "partial", 
                         "text": text_result, 
                         "elapsed_s": elapsed
@@ -274,7 +389,7 @@ async def process_audio(websocket):
                     num_samples=num_samples
                 )
                 
-                await websocket.send(json.dumps({
+                global_outbound_queue.put_nowait(json.dumps({
                     "status": "success", 
                     "id": event_id,
                     "text": text_result, 
@@ -306,7 +421,7 @@ async def process_audio(websocket):
                 print(f"[ERRO] Falha no processamento do chunk: {err}")
                 _append_feed_event("error", error=err)
                 try:
-                    await websocket.send(json.dumps({"status": "error", "error": err}))
+                    global_outbound_queue.put_nowait(json.dumps({"status": "error", "error": err}))
                 except Exception as send_err:
                     print(f"[ERRO] Falha ao devolver erro ao cliente: {send_err}")
                 
@@ -314,6 +429,10 @@ async def process_audio(websocket):
         print(f"[CONEXÃO] Rust desconectou (code={closed.code}, reason={closed.reason}).")
     except Exception as e:
         print(f"[ERRO] Falha na conexão websocket: {e}")
+    finally:
+        sender_task.cancel()
+        global_outbound_queue = None
+        main_loop = None
 
 
 async def main():
@@ -323,6 +442,10 @@ async def main():
     
     # Inicia o Trator de Fila de Tradução Oculto
     worker_task = asyncio.create_task(translation_worker())
+    
+    # Inicia o Trabalhador de TTS (Síncrono/Bloqueante) em Thread Separada
+    tts_thread = threading.Thread(target=tts_worker, daemon=True)
+    tts_thread.start()
     
     async with websockets.serve(process_audio, "127.0.0.1", PORT, ping_interval=None, ping_timeout=None):
         await asyncio.Future()

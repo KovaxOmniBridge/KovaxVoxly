@@ -8,7 +8,17 @@ use std::time::Duration;
 pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let mic = host.default_input_device().expect("Mic não encontrado");
-    let out = host.default_output_device().expect("Saída não encontrada");
+
+    // Tenta encontrar a entrada do Virtual Cable que alimentará o Google Meet
+    let out = host.output_devices()
+        .expect("Falha ao listar saídas")
+        .find(|d| d.name().unwrap_or_default().to_lowercase().contains("cable input"))
+        .unwrap_or_else(|| {
+            println!("\n[!] Aviso crítico: 'CABLE Input' não detectado.");
+            println!("    Isso significa que o driver Virtual Cable não instalou corretamente ou precisa de boot.");
+            println!("    Fallback: Usando saída de áudio padrão (caixas de som).\n");
+            host.default_output_device().expect("Saída padrão não encontrada")
+        });
 
     let config: cpal::StreamConfig = mic.default_input_config()?.into();
     let native_sr = config.sample_rate.0;
@@ -25,6 +35,9 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     // Novo Canal: ID do locutor, IS_FINAL, Áudio f32
     let (tx_whisper, mut rx_whisper) =
         tokio::sync::mpsc::unbounded_channel::<(usize, bool, Vec<f32>)>();
+
+    // Novo Canal TPS (Text-to-Speech)
+    let (tx_tts, rx_tts) = mpsc::channel::<(u32, Vec<f32>)>();
 
     // --- THREAD DE INTELIGÊNCIA ---
     thread::spawn(move || {
@@ -169,7 +182,7 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         println!("[WHISPER] Aguardando serviço Python local (127.0.0.1:8000)...");
 
         'whisper_bridge: loop {
-            let mut stream = loop {
+            let stream = loop {
                 match connect_async("ws://127.0.0.1:8000").await {
                     Ok((stream, _)) => {
                         println!("\x1b[32m[✓]\x1b[0m Conectado ao Whisper Python WS!");
@@ -181,69 +194,86 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            while let Some((speaker_id, is_final, audio_data)) = rx_whisper.recv().await {
-                // FASE 3: Envelopar (is_final || bytes_de_f32) em um único pacote WebSocket
-                let mut byte_data: Vec<u8> = vec![if is_final { 1 } else { 0 }];
+            let (mut ws_sender, mut ws_receiver) = stream.split();
+            let tx_tts_clone = tx_tts.clone();
 
-                // Converte o Vec<f32> em puro byte stream (Little Endian)
+            // Task para RECEBER dados do Python simultaneamente
+            let rx_task = tokio::spawn(async move {
+                while let Some(msg_result) = ws_receiver.next().await {
+                    match msg_result {
+                        Ok(Message::Text(txt)) => {
+                            // Rust só imprime o JSON cru agora porque o launcher GUI parseia.
+                            println!("\n\x1b[35m[AÇÃO PYTHON]\x1b[0m {}", txt);
+                        }
+                        Ok(Message::Binary(bin)) => {
+                            // 0x02 = TTS Audio PCM
+                            if bin.len() >= 5 && bin[0] == 2 {
+                                let sr = u32::from_le_bytes([bin[1], bin[2], bin[3], bin[4]]);
+                                let audio_bytes = &bin[5..];
+                                let mut tts_audio = Vec::with_capacity(audio_bytes.len() / 4);
+                                for chunk in audio_bytes.chunks_exact(4) {
+                                    let val = f32::from_le_bytes([
+                                        chunk[0], chunk[1], chunk[2], chunk[3],
+                                    ]);
+                                    tts_audio.push(val);
+                                }
+                                let _ = tx_tts_clone.send((sr, tts_audio));
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        _ => {}
+                    }
+                }
+            });
+
+            while let Some((speaker_id, is_final, audio_data)) = rx_whisper.recv().await {
+                let mut byte_data: Vec<u8> = vec![if is_final { 1 } else { 0 }];
                 byte_data.extend(audio_data.iter().flat_map(|&f| f.to_le_bytes()));
 
-                if let Err(e) = stream
-                    .send(Message::Binary(bytes::Bytes::from(byte_data)))
-                    .await
-                {
+                if let Err(e) = ws_sender.send(Message::Binary(byte_data.into())).await {
                     eprintln!(
                         "[WHISPER] Erro ao enviar áudio: {}. Tentando reconectar...",
                         e
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    continue 'whisper_bridge;
-                }
-
-                // Aguarda resposta do Python em JSON, com timeout para não travar
-                // indefinidamente caso o servidor fique preso em inferência.
-                match tokio::time::timeout(tokio::time::Duration::from_secs(45), stream.next())
-                    .await
-                {
-                    Ok(Some(Ok(Message::Text(txt)))) => {
-                        println!(
-                            "\n\x1b[35m[TRANSCRIÇÃO -> Locutor {}]\x1b[0m {}",
-                            speaker_id, txt
-                        );
-                    }
-                    Ok(Some(Ok(Message::Close(frame)))) => {
-                        eprintln!(
-                            "[WHISPER] Servidor encerrou conexão ({:?}). Reconectando...",
-                            frame
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        continue 'whisper_bridge;
-                    }
-                    Ok(Some(Ok(_))) => {}
-                    Ok(Some(Err(e))) => {
-                        eprintln!("[WHISPER] Erro na resposta: {}. Tentando reconectar...", e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        continue 'whisper_bridge;
-                    }
-                    Ok(None) => {
-                        eprintln!("[WHISPER] Conexão encerrada pelo servidor. Reconectando...");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        continue 'whisper_bridge;
-                    }
-                    Err(_) => {
-                        eprintln!("[WHISPER] Timeout aguardando transcrição. Reconectando...");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        continue 'whisper_bridge;
-                    }
+                    break;
                 }
             }
 
-            break;
+            rx_task.abort();
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            continue 'whisper_bridge;
         }
     });
 
     let rb = HeapRb::<f32>::new(native_sr as usize * 2);
     let (mut prod, mut cons) = rb.split();
+
+    // Buffer para Áudio Sintetizado (TTS)
+    // 15 segundos para comportar frases longas traduzidas chegando antes do áudio tocar
+    let tts_rb = HeapRb::<f32>::new(out_config.sample_rate.0 as usize * 15);
+    let (mut tts_prod, mut tts_cons) = tts_rb.split();
+    let out_sr = out_config.sample_rate.0 as f32;
+
+    // Resampling ingênuo e ingestão de TTS em Thread Separada
+    thread::spawn(move || {
+        while let Ok((sr, tts_audio)) = rx_tts.recv() {
+            let sample_step = sr as f32 / out_sr;
+            let mut current_pos = 0.0f32;
+            let len = tts_audio.len();
+
+            while (current_pos as usize) < len {
+                let idx = current_pos as usize;
+
+                // Spin-lock amigável se o buffer encher
+                while tts_prod.is_full() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let _ = tts_prod.push(tts_audio[idx]);
+
+                current_pos += sample_step;
+            }
+        }
+    });
 
     let mut chunk_collector = Vec::with_capacity(512);
     let sample_step = native_sr as f32 / 16000.0;
@@ -307,9 +337,16 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         &out_config,
         move |data: &mut [f32], _| {
             for frame in data.chunks_mut(out_channels) {
-                let val = cons.pop().unwrap_or(0.0);
+                // Remove o áudio do microfone mas contunua lendo para não estourar o buffer
+                let _mic_val = cons.pop().unwrap_or(0.0);
+
+                // Pega o áudio falado gerado pelo Piper
+                let tts_val = tts_cons.pop().unwrap_or(0.0);
+
+                // O Google Meet vai escutar APENAS a IA traduzida,
+                // para evitar que o cancelamento de eco corte a chamada!
                 for s in frame {
-                    *s = val;
+                    *s = tts_val;
                 }
             }
         },
