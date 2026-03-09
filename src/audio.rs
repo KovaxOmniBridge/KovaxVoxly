@@ -31,26 +31,27 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let df_size = denoiser.frame_size();
     let mut df_buffer = Vec::with_capacity(df_size);
 
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    // Novo Canal: ID do locutor, IS_FINAL, Áudio f32
-    let (tx_whisper, mut rx_whisper) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, bool, Vec<f32>)>();
+    // TX para o Microfone (Você)
+    let (tx_mic, rx_mic) = mpsc::channel::<Vec<f32>>();
+    // TX para o Loopback (Os outros na chamada)
+    let (tx_sys, rx_sys) = mpsc::channel::<Vec<f32>>();
 
-    // Novo Canal TPS (Text-to-Speech)
-    let (tx_tts, rx_tts) = mpsc::channel::<(u32, Vec<f32>)>();
+    // Novo Canal Unificado: ORIGEM (0 = Mic, 1 = Sis), IS_FINAL, Áudio f32
+    let (tx_whisper, mut rx_whisper) =
+        tokio::sync::mpsc::unbounded_channel::<(u8, bool, Vec<f32>)>();
+
+    // Duplica o channel sender para uso nas duas threads
+    let tx_whisper_mic = tx_whisper.clone();
+    let tx_whisper_sys = tx_whisper.clone();
 
     // --- THREAD DE INTELIGÊNCIA ---
     thread::spawn(move || {
         let mut vad = engine::Vad::new("models/silero_vad.onnx").expect("Erro VAD");
-        let mut diarizer =
-            engine::Diarizer::new("models/segmentation-3.0.onnx").expect("Erro Diarizer");
 
         let mut pre_roll = engine::buffers::PreRollBuffer::new(8000);
         let mut recording_buffer = Vec::new();
         let mut is_recording = false;
         let mut silence_frames = 0;
-        let mut current_speaker = 0;
-        let mut last_diarization_len = 0;
         let mut last_partial_len = 0; // Para despachar transcrição parcial a cada X ms
 
         // Sensibilidade e limites de flush para não depender apenas de silêncio
@@ -73,16 +74,10 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                 recording_buffer.extend(samples);
                 silence_frames = 0;
 
-                // OTIMIZAÇÃO DE CPU: Rodar a diarização a cada ~1 segundo de áudio acumulado (16000 samples)
-                if recording_buffer.len() >= last_diarization_len + 16000 {
-                    current_speaker = diarizer.identify(&recording_buffer);
-                    last_diarization_len = recording_buffer.len();
-                }
-
                 // FASE 3 (STREAMING ASR): Disparar Pacotes Parciais a cada ~1.0 segundo (16000 samples).
                 // Isso cria o efeito "Palavras Mágicas flutuantes" na interface (is_final = false).
                 if recording_buffer.len() >= last_partial_len + 16000 {
-                    let _ = tx_whisper.send((current_speaker, false, recording_buffer.clone()));
+                    let _ = tx_whisper.send((0, false, recording_buffer.clone())); // 0 = Microfone
                     last_partial_len = recording_buffer.len();
                 }
 
@@ -92,12 +87,10 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                         "\n\x1b[36m[WHISPER]\x1b[0m Flush absoluto por duração limite (~{:.1}s)",
                         recording_buffer.len() as f32 / 16000.0
                     );
-                    let _ = tx_whisper.send((current_speaker, true, recording_buffer.clone())); // Força como FINAL
+                    let _ = tx_whisper.send((0, true, recording_buffer.clone())); // Força como FINAL
                     recording_buffer.clear();
-                    last_diarization_len = 0;
                     last_partial_len = 0;
                     vad.reset_states();
-                    diarizer.reset_history();
                 }
 
                 let bars = (probability * 20.0) as usize;
@@ -117,14 +110,11 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     Print("[VAD] "),
                     ResetColor,
                     Print(format!(
-                        "[{}{}] {:.0}% | Locutor ",
+                        "[{}{}] {:.0}%",
                         bar_str,
                         space_str,
                         probability * 100.0
                     )),
-                    SetForegroundColor(Color::Cyan),
-                    Print(format!("{}", current_speaker)),
-                    ResetColor,
                     Print(format!(
                         " | {:.1}s",
                         recording_buffer.len() as f32 / 16000.0
@@ -157,17 +147,16 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                         println!(
                             "\n\x1b[32m[✓]\x1b[0m Silêncio Detectado. Fechando frase e acionando NLLB Trnslator..."
                         );
-                        let _ = tx_whisper.send((current_speaker, true, recording_buffer.clone()));
+                        let _ = tx_whisper.send((0, true, recording_buffer.clone()));
+                        // 0 = Origem Microfone
                     }
 
                     recording_buffer.clear();
-                    last_diarization_len = 0;
                     last_partial_len = 0;
                     is_recording = false;
 
                     // Reseta os estados preditivos para a próxima frase não sofrer vazamento
                     vad.reset_states();
-                    diarizer.reset_history();
                 }
             }
         }
@@ -195,9 +184,8 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let (mut ws_sender, mut ws_receiver) = stream.split();
-            let tx_tts_clone = tx_tts.clone();
 
-            // Task para RECEBER dados do Python simultaneamente
+            // Task para RECEBER dados do Python
             let rx_task = tokio::spawn(async move {
                 while let Some(msg_result) = ws_receiver.next().await {
                     match msg_result {
@@ -205,29 +193,15 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                             // Rust só imprime o JSON cru agora porque o launcher GUI parseia.
                             println!("\n\x1b[35m[AÇÃO PYTHON]\x1b[0m {}", txt);
                         }
-                        Ok(Message::Binary(bin)) => {
-                            // 0x02 = TTS Audio PCM
-                            if bin.len() >= 5 && bin[0] == 2 {
-                                let sr = u32::from_le_bytes([bin[1], bin[2], bin[3], bin[4]]);
-                                let audio_bytes = &bin[5..];
-                                let mut tts_audio = Vec::with_capacity(audio_bytes.len() / 4);
-                                for chunk in audio_bytes.chunks_exact(4) {
-                                    let val = f32::from_le_bytes([
-                                        chunk[0], chunk[1], chunk[2], chunk[3],
-                                    ]);
-                                    tts_audio.push(val);
-                                }
-                                let _ = tx_tts_clone.send((sr, tts_audio));
-                            }
-                        }
                         Ok(Message::Close(_)) => break,
                         _ => {}
                     }
                 }
             });
 
-            while let Some((speaker_id, is_final, audio_data)) = rx_whisper.recv().await {
-                let mut byte_data: Vec<u8> = vec![if is_final { 1 } else { 0 }];
+            while let Some((source_id, is_final, audio_data)) = rx_whisper.recv().await {
+                // Header binário: [0x01 = ASR Audio] [SourceID u8] [IsFinal u8] [Float32 PCM...]
+                let mut byte_data: Vec<u8> = vec![1, source_id, if is_final { 1 } else { 0 }];
                 byte_data.extend(audio_data.iter().flat_map(|&f| f.to_le_bytes()));
 
                 if let Err(e) = ws_sender.send(Message::Binary(byte_data.into())).await {
@@ -242,36 +216,6 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
             rx_task.abort();
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             continue 'whisper_bridge;
-        }
-    });
-
-    let rb = HeapRb::<f32>::new(native_sr as usize * 2);
-    let (mut prod, mut cons) = rb.split();
-
-    // Buffer para Áudio Sintetizado (TTS)
-    // 15 segundos para comportar frases longas traduzidas chegando antes do áudio tocar
-    let tts_rb = HeapRb::<f32>::new(out_config.sample_rate.0 as usize * 15);
-    let (mut tts_prod, mut tts_cons) = tts_rb.split();
-    let out_sr = out_config.sample_rate.0 as f32;
-
-    // Resampling ingênuo e ingestão de TTS em Thread Separada
-    thread::spawn(move || {
-        while let Ok((sr, tts_audio)) = rx_tts.recv() {
-            let sample_step = sr as f32 / out_sr;
-            let mut current_pos = 0.0f32;
-            let len = tts_audio.len();
-
-            while (current_pos as usize) < len {
-                let idx = current_pos as usize;
-
-                // Spin-lock amigável se o buffer encher
-                while tts_prod.is_full() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                let _ = tts_prod.push(tts_audio[idx]);
-
-                current_pos += sample_step;
-            }
         }
     });
 
@@ -308,8 +252,6 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     for &clean_s in &df_buffer {
-                        let _ = prod.push(clean_s);
-
                         // 2. Coleta para a IA (Resampling simplificado)
                         current_pos += 1.0;
                         if current_pos >= sample_step {
@@ -317,10 +259,7 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
                             current_pos -= sample_step; // Subtrai em vez de zerar
 
                             if chunk_collector.len() >= 512 {
-                                // FORÇAR ENVIO: O Rio agora deságua na IA
-                                if let Err(e) = tx.send(chunk_collector.clone()) {
-                                    eprintln!("Erro ao enviar chunk para IA: {}", e);
-                                }
+                                let _ = tx_mic.send(chunk_collector.clone());
                                 chunk_collector.clear();
                             }
                         }
@@ -333,20 +272,24 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
-    let output_stream = out.build_output_stream(
+    let mut sys_chunk_collector = Vec::with_capacity(512);
+    let sys_sample_step = out_config.sample_rate.0 as f32 / 16000.0;
+    let mut sys_pos = 0.0f32;
+
+    let output_stream = out.build_input_stream(
         &out_config,
-        move |data: &mut [f32], _| {
-            for frame in data.chunks_mut(out_channels) {
-                // Remove o áudio do microfone mas contunua lendo para não estourar o buffer
-                let _mic_val = cons.pop().unwrap_or(0.0);
+        move |data: &[f32], _| {
+            for frame in data.chunks(out_channels) {
+                let s = frame[0]; // Captura mono do Desktop
+                sys_pos += 1.0;
+                if sys_pos >= sys_sample_step {
+                    sys_chunk_collector.push(s);
+                    sys_pos -= sys_sample_step;
 
-                // Pega o áudio falado gerado pelo Piper
-                let tts_val = tts_cons.pop().unwrap_or(0.0);
-
-                // O Google Meet vai escutar APENAS a IA traduzida,
-                // para evitar que o cancelamento de eco corte a chamada!
-                for s in frame {
-                    *s = tts_val;
+                    if sys_chunk_collector.len() >= 512 {
+                        let _ = tx_sys.send(sys_chunk_collector.clone());
+                        sys_chunk_collector.clear();
+                    }
                 }
             }
         },

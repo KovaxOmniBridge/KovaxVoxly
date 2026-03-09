@@ -22,10 +22,6 @@ ndarray = "0.15"
 
 # Supressão de Ruído Profissional
 deep_filter = "0.2"
-
-# Gerenciamento de Registro (para o driver.rs não pedir Admin toda vez)
-winreg = "0.11"
-hound = "3.5.1"
 crossterm = "0.29.0"
 futures-util = { version = "0.3.32", features = ["sink"] }
 tokio-tungstenite = "0.28.0"

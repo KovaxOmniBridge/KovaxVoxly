@@ -11,14 +11,12 @@ dependencies = [
  "crossterm",
  "deep_filter",
  "futures-util",
- "hound",
  "ndarray 0.15.6",
  "ort",
  "ringbuf",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
- "winreg",
 ]
 
 [[package]]
@@ -546,12 +544,6 @@ name = "hmac-sha256"
 version = "1.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
-
-[[package]]
-name = "hound"
-version = "3.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "http"
@@ -2056,16 +2048,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "winreg"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a1a57ff50e9b408431e8f97d5456f2807f8eb2a2cd79b06068fc87f8ecf189"
-dependencies = [
- "cfg-if",
- "winapi",
 ]
 
 [[package]]

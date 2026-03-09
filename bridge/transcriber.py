@@ -15,11 +15,8 @@ from huggingface_hub import snapshot_download, hf_hub_download
 from transformers import AutoTokenizer
 import queue
 import threading
-import sounddevice as sd
-import soundfile as sf
 import io
 import wave
-from piper.voice import PiperVoice
 
 # --- CONFIGURAÇÃO ---
 PORT = 8000
@@ -134,90 +131,8 @@ print(f"[+] Modelos carregados na memória!", flush=True)
 # Desacopla a Tradução (Lenta) da Transcrição (Rápida).
 translation_queue = asyncio.Queue()
 
-# Desacopla a Geração de Fala (TTS) da Tradução
-tts_queue = queue.Queue()
-
 global_outbound_queue = None
 main_loop = None
-
-def download_piper_model(lang_code):
-    PIPER_MODELS = {
-        "eng_Latn": ("en/en_US/lessac/medium/en_US-lessac-medium.onnx", "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"),
-        "spa_Latn": ("es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx", "es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx.json"),
-        "por_Latn": ("pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx", "pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json"),
-        "fra_Latn": ("fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx", "fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json"),
-        "deu_Latn": ("de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx", "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json"),
-        "ita_Latn": ("it/it_IT/paola/medium/it_IT-paola-medium.onnx", "it/it_IT/paola/medium/it_IT-paola-medium.onnx.json")
-    }
-    
-    if lang_code not in PIPER_MODELS:
-        print(f"[AVISO] Idioma {lang_code} não suportado pelo Piper localmente, usando Inglês.", flush=True)
-        lang_code = "eng_Latn"
-        
-    onnx_file, json_file = PIPER_MODELS[lang_code]
-    print(f"[*] Verificando/Baixando modelo Piper TTS para {lang_code}...", flush=True)
-    onnx_path = hf_hub_download(repo_id="rhasspy/piper-voices", filename=onnx_file)
-    json_path = hf_hub_download(repo_id="rhasspy/piper-voices", filename=json_file)
-    return onnx_path, json_path
-
-def tts_worker():
-    current_lang = None
-    voice = None
-
-    while True:
-        try:
-            job = tts_queue.get()
-            if job is None:
-                break
-                
-            text = job["text"]
-            lang_code = job["lang_code"]
-            
-            # Carrega/atualiza voz se o idioma mudou
-            if current_lang != lang_code or voice is None:
-                print(f"[TTS] Carregando voz Piper para {lang_code}...", flush=True)
-                onnx_path, json_path = download_piper_model(lang_code)
-                voice = PiperVoice.load(onnx_path, config_path=json_path)
-                current_lang = lang_code
-                print(f"[TTS] Voz carregada na memória!", flush=True)
-                
-            with open(json_path, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-            sample_rate = cfg.get("audio", {}).get("sample_rate", 22050)
-                
-            # Gera audio diretamente em PCM float32 usando o gerador interno do Piper
-            start_tts = time.time()
-            
-            # synthesize() retorna um iterador de AudioChunks
-            audio_f32_chunks = []
-            for chunk in voice.synthesize(text):
-                # O chunk já fornece o array numpy f32 normalizado
-                audio_f32_chunks.append(chunk.audio_float_array)
-            
-            if not audio_f32_chunks:
-                print(f"[TTS] Aviso: Piper não gerou nenhum áudio para o texto '{text}'", flush=True)
-                tts_queue.task_done()
-                continue
-                
-            # Concatena todos os pedaços da frase em um único array f32 1D
-            audio_f32 = np.concatenate(audio_f32_chunks)
-            
-            print(f"[TTS] Áudio gerado ({time.time() - start_tts:.2f}s). {len(audio_f32)} amostras. Enviando PCM {sample_rate}Hz para o Rust...", flush=True)
-            
-            # Formato Binário: [0x02: u8] [SampleRate: u32_LE] [F32 PCM...]
-            header = struct.pack('<BI', 2, sample_rate)
-            msg = header + audio_f32.tobytes()
-            
-            if main_loop is not None and global_outbound_queue is not None:
-                main_loop.call_soon_threadsafe(global_outbound_queue.put_nowait, msg)
-            
-            tts_queue.task_done()
-        except Exception as e:
-            print(f"[ERRO] Worker de TTS falhou: {e}", flush=True)
-            try:
-                tts_queue.task_done()
-            except:
-                pass
 
 async def translation_worker():
     """Worker rodando perpetuamente em 2º plano aguardando frases para traduzir."""
@@ -278,12 +193,6 @@ async def translation_worker():
             except Exception:
                 pass
             
-            # 5. Envia a tradução para o Worker de TTS para ser falada
-            if traduction_result:
-                tts_queue.put({
-                    "text": traduction_result,
-                    "lang_code": config["output_nllb"]
-                })
             
             translation_queue.task_done()
             
@@ -442,10 +351,6 @@ async def main():
     
     # Inicia o Trator de Fila de Tradução Oculto
     worker_task = asyncio.create_task(translation_worker())
-    
-    # Inicia o Trabalhador de TTS (Síncrono/Bloqueante) em Thread Separada
-    tts_thread = threading.Thread(target=tts_worker, daemon=True)
-    tts_thread.start()
     
     async with websockets.serve(process_audio, "127.0.0.1", PORT, ping_interval=None, ping_timeout=None):
         await asyncio.Future()
