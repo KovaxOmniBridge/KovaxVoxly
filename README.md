@@ -7,9 +7,15 @@
   <img src="https://img.shields.io/badge/Faster--Whisper-STT-blue?style=for-the-badge" alt="Faster Whisper" />
   <img src="https://img.shields.io/badge/NLLB--200-Translation-green?style=for-the-badge" alt="NLLB Translation" />
   <img src="https://img.shields.io/badge/Piper--TTS-Synthesis-orange?style=for-the-badge" alt="Piper TTS" />
+  <img src="https://img.shields.io/badge/Status-Em_Desenvolvimento-yellow?style=for-the-badge" alt="Status" />
 </p>
 
 **Voxly** é um sistema avançado e de baixa latência para **transcrição, tradução neural e sintetização de voz em tempo real (Bi-direcional)**. Desenvolvido para reuniões online (Zoom, Google Meet, Teams, Discord), chamadas internacionais e atendimento, o Voxly permite traduzir simultaneamente o áudio do seu microfone para quem está ouvindo e o áudio da reunião de volta para você em seu idioma nativo.
+
+> [!WARNING]
+> **Status de Maturidade: Projeto em Desenvolvimento (WIP / PoC)**
+>
+> O Voxly encontra-se atualmente em estágio **experimental e de desenvolvimento ativo**. O projeto **ainda não está 100% completo nem totalmente estável/funcional** para ambientes de produção. Algumas funcionalidades, como a captura em certos setups de áudio, a sincronização de voz em tempo real e a estabilidade dos modelos de IA, continuam recebendo ajustes e aprimoramentos. Feedback e contribuições são muito bem-vindos!
 
 ---
 
