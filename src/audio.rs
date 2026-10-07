@@ -1,24 +1,95 @@
-use crate::engine;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use serde::{Serialize};
 
-pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Clone, Default)]
+pub struct AudioConfig {
+    pub mic_name: Option<String>,
+    pub meeting_name: Option<String>,
+    pub output_name: Option<String>,
+}
+
+pub async fn start_bridge(cfg: AudioConfig) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[IA] Motores ativos. Inicializando streams...");
     let host = cpal::default_host();
-    let mic = host.default_input_device().expect("Mic não encontrado");
+    
+    // --- SELEÇÃO DE MICROFONE (EU) ---
+    let mut mic = if let Some(ref name) = cfg.mic_name {
+        if name == "Padrão" {
+            host.default_input_device().expect("Mic padrão não encontrado")
+        } else {
+            host.input_devices()?
+                .find(|d| d.name().unwrap_or_default() == *name)
+                .ok_or_else(|| format!("Dispositivo de Mic '{}' não encontrado", name))?
+        }
+    } else {
+        host.default_input_device().expect("Mic padrão não encontrado")
+    };
 
-    // Tenta encontrar a entrada do Virtual Cable que alimentará o Google Meet
-    let out = host.output_devices()
-        .expect("Falha ao listar saídas")
-        .find(|d| d.name().unwrap_or_default().to_lowercase().contains("cable input"))
-        .unwrap_or_else(|| {
-            println!("\n[!] Aviso crítico: 'CABLE Input' não detectado.");
-            println!("    Isso significa que o driver Virtual Cable não instalou corretamente ou precisa de boot.");
-            println!("    Fallback: Usando saída de áudio padrão (caixas de som).\n");
-            host.default_output_device().expect("Saída padrão não encontrada")
-        });
+    let mic_name_lower = mic.name().unwrap_or_default().to_lowercase();
+    
+    // Proteção automática se não for especificado: Evita capturar do Virtual Cable se o usuário esqueceu
+    if cfg.mic_name.is_none() && (mic_name_lower.contains("cable") || mic_name_lower.contains("virtual")) {
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(real_mic) = devices.find(|d| {
+                let name = d.name().unwrap_or_default().to_lowercase();
+                !name.contains("cable") && !name.contains("virtual") && !name.contains("mix")
+            }) {
+                mic = real_mic;
+            }
+        }
+    }
+    println!("🎙️ Microfone Ativo: {}", mic.name().unwrap_or_default());
+
+    // --- SELEÇÃO DE SAÍDA (TRADUÇÃO) ---
+    let out = if let Some(ref name) = cfg.output_name {
+        if name == "Padrão" {
+            host.default_output_device().expect("Saída padrão zero.")
+        } else {
+            host.output_devices()?
+                .find(|d| d.name().unwrap_or_default() == *name)
+                .ok_or_else(|| format!("Dispositivo de Saída '{}' não encontrado", name))?
+        }
+    } else {
+        // Fallback inteligente para "CABLE Input" se disponível
+        host.output_devices()?
+            .find(|d| d.name().unwrap_or_default().to_lowercase().contains("cable input"))
+            .unwrap_or_else(|| {
+                println!("[!] Aviso: 'CABLE Input' manual não definido e não auto-detectado. Usando padrão.");
+                host.default_output_device().expect("Saída padrão zero.")
+            })
+    };
+    println!("🔊 Saída de Tradução Ativa: {}", out.name().unwrap_or_default());
+
+    // --- SELEÇÃO DE FONTE DE REUNIÃO (LOOPBACK) ---
+    let loopback_dev = if let Some(ref name) = cfg.meeting_name {
+        if name == "Padrão" {
+            host.input_devices()?
+                .find(|d| {
+                    let n = d.name().unwrap_or_default().to_lowercase();
+                    n.contains("cable output") || n.contains("stereo mix") || n.contains("loopback")
+                })
+        } else {
+            host.input_devices()?
+                .find(|d| d.name().unwrap_or_default() == *name)
+        }
+    } else {
+        // Fallback inteligente para "CABLE Output" ou Stereo Mix
+        host.input_devices()?
+            .find(|d| {
+                let name = d.name().unwrap_or_default().to_lowercase();
+                name.contains("cable output") || name.contains("stereo mix") || name.contains("loopback")
+            })
+    };
+
+    if let Some(ref dev) = loopback_dev {
+        println!("👥 Fonte de Reunião Ativa: {}", dev.name().unwrap_or_default());
+    } else {
+        println!("⚠️ Aviso: Nenhuma fonte de reunião (loopback) ativa. Você só traduzirá o seu microfone.");
+    }
 
     let config: cpal::StreamConfig = mic.default_input_config()?.into();
     let native_sr = config.sample_rate.0;
@@ -27,305 +98,216 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
     let out_config: cpal::StreamConfig = out.default_output_config()?.into();
     let out_channels = out_config.channels as usize;
 
-    let mut denoiser = engine::Denoiser::new(native_sr)?;
-    let df_size = denoiser.frame_size();
-    let mut df_buffer = Vec::with_capacity(df_size);
-
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    // Novo Canal: ID do locutor, IS_FINAL, Áudio f32
-    let (tx_whisper, mut rx_whisper) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, bool, Vec<f32>)>();
-
-    // Novo Canal TPS (Text-to-Speech)
+    let (tx, rx) = mpsc::channel::<(usize, Vec<f32>)>();
+    let (tx_whisper, mut rx_whisper) = tokio::sync::mpsc::unbounded_channel::<(usize, bool, Vec<f32>)>();
     let (tx_tts, rx_tts) = mpsc::channel::<(u32, Vec<f32>)>();
 
-    // --- THREAD DE INTELIGÊNCIA ---
+    struct VadState {
+        recording_buffer: Vec<f32>,
+        silence_frames: usize,
+        is_recording: bool,
+        partial_timer: usize,
+    }
+
+    impl Default for VadState {
+        fn default() -> Self {
+            Self {
+                recording_buffer: Vec::new(),
+                silence_frames: 0,
+                is_recording: false,
+                partial_timer: 0,
+            }
+        }
+    }
+
+    let last_mic_now = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_mic_vad = last_mic_now.clone();
+    let last_tts_now = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_tts_vad = last_tts_now.clone();
+    
+    let ptt_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ptt_vad = ptt_active.clone();
+    let ptt_ws = ptt_active.clone();
+    
+    // Thread de VAD (Mantemos thread::spawn para prioridade de CPU no áudio)
     thread::spawn(move || {
-        let mut vad = engine::Vad::new("models/silero_vad.onnx").expect("Erro VAD");
-        let mut diarizer =
-            engine::Diarizer::new("models/segmentation-3.0.onnx").expect("Erro Diarizer");
+        let mut states = vec![VadState::default(), VadState::default()];
+        let silence_threshold = 0.0050; // Aumentado levemente para evitar ruído de fundo
+        let silence_max_frames: usize = 65; 
 
-        let mut pre_roll = engine::buffers::PreRollBuffer::new(8000);
-        let mut recording_buffer = Vec::new();
-        let mut is_recording = false;
-        let mut silence_frames = 0;
-        let mut current_speaker = 0;
-        let mut last_diarization_len = 0;
-        let mut last_partial_len = 0; // Para despachar transcrição parcial a cada X ms
-
-        // Sensibilidade e limites de flush para não depender apenas de silêncio
-        let vad_speech_threshold = 0.05f32;
-        let max_chunk_samples = 16000usize * 8usize; // Limite longo fixo
-
-        println!("[IA] Motores ativos. Fale no microfone...");
-
-        while let Ok(samples) = rx.recv() {
-            pre_roll.push_samples(&samples);
-
-            let probability = vad.is_speech(samples.clone());
-
-            // Sensibilidade mais permissiva para evitar perda de fala em microfones comuns
-            if probability > vad_speech_threshold {
-                if !is_recording {
-                    is_recording = true;
-                    pre_roll.drain_to(&mut recording_buffer);
-                }
-                recording_buffer.extend(samples);
-                silence_frames = 0;
-
-                // OTIMIZAÇÃO DE CPU: Rodar a diarização a cada ~1 segundo de áudio acumulado (16000 samples)
-                if recording_buffer.len() >= last_diarization_len + 16000 {
-                    current_speaker = diarizer.identify(&recording_buffer);
-                    last_diarization_len = recording_buffer.len();
-                }
-
-                // FASE 3 (STREAMING ASR): Disparar Pacotes Parciais a cada ~1.0 segundo (16000 samples).
-                // Isso cria o efeito "Palavras Mágicas flutuantes" na interface (is_final = false).
-                if recording_buffer.len() >= last_partial_len + 16000 {
-                    let _ = tx_whisper.send((current_speaker, false, recording_buffer.clone()));
-                    last_partial_len = recording_buffer.len();
-                }
-
-                // Flush forçado absoluto (Segurança Limite de Memória e Demora)
-                if recording_buffer.len() >= max_chunk_samples {
-                    println!(
-                        "\n\x1b[36m[WHISPER]\x1b[0m Flush absoluto por duração limite (~{:.1}s)",
-                        recording_buffer.len() as f32 / 16000.0
-                    );
-                    let _ = tx_whisper.send((current_speaker, true, recording_buffer.clone())); // Força como FINAL
-                    recording_buffer.clear();
-                    last_diarization_len = 0;
-                    last_partial_len = 0;
-                    vad.reset_states();
-                    diarizer.reset_history();
-                }
-
-                let bars = (probability * 20.0) as usize;
-                let bar_str = "█".repeat(bars);
-                let space_str = " ".repeat(20 - bars);
-
-                use crossterm::{
-                    cursor, execute,
-                    style::{Color, Print, ResetColor, SetForegroundColor},
-                    terminal,
-                };
-                let _ = execute!(
-                    std::io::stdout(),
-                    cursor::MoveToColumn(0),
-                    terminal::Clear(terminal::ClearType::UntilNewLine),
-                    SetForegroundColor(Color::Green),
-                    Print("[VAD] "),
-                    ResetColor,
-                    Print(format!(
-                        "[{}{}] {:.0}% | Locutor ",
-                        bar_str,
-                        space_str,
-                        probability * 100.0
-                    )),
-                    SetForegroundColor(Color::Cyan),
-                    Print(format!("{}", current_speaker)),
-                    ResetColor,
-                    Print(format!(
-                        " | {:.1}s",
-                        recording_buffer.len() as f32 / 16000.0
-                    ))
-                );
-            } else if is_recording {
-                recording_buffer.extend(samples);
-                silence_frames += 1;
-
-                use crossterm::{
-                    cursor, execute,
-                    style::{Color, Print, ResetColor, SetForegroundColor},
-                    terminal,
-                };
-                let _ = execute!(
-                    std::io::stdout(),
-                    cursor::MoveToColumn(0),
-                    terminal::Clear(terminal::ClearType::UntilNewLine),
-                    SetForegroundColor(Color::Yellow),
-                    Print("[VAD] "),
-                    ResetColor,
-                    Print(format!("Analisando silêncio... ({} / 20)", silence_frames))
-                );
-
-                // Usa 20 quadros de silêncio para não "cortar" palavras como T-estando
-                // antes da pessoa terminar de emitir o som da consoante inicial.
-                if silence_frames > 20 {
-                    // CORTA O ÁUDIO E DECLARA FRASE FINAL (is_final = true)
-                    if recording_buffer.len() > 16000 {
-                        println!(
-                            "\n\x1b[32m[✓]\x1b[0m Silêncio Detectado. Fechando frase e acionando NLLB Trnslator..."
-                        );
-                        let _ = tx_whisper.send((current_speaker, true, recording_buffer.clone()));
+        while let Ok((source_id, samples)) = rx.recv() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let last_tts = last_tts_vad.load(std::sync::atomic::Ordering::Relaxed);
+            let last_mic = last_mic_vad.load(std::sync::atomic::Ordering::Relaxed);
+            let ptt = ptt_vad.load(std::sync::atomic::Ordering::Relaxed);
+            
+            // --- LÓGICA CONDUCTOR (EXCLUSIVIDADE TOTAL) ---
+            if source_id == 0 {
+                // Seu microfone SÓ funciona se o Espaço estiver apertado
+                if !ptt {
+                    let state = &mut states[source_id];
+                    if state.is_recording {
+                        if state.recording_buffer.len() > 4000 { 
+                            let _ = tx_whisper.send((source_id, true, state.recording_buffer.clone()));
+                        }
+                        state.recording_buffer.clear();
+                        state.is_recording = false;
                     }
+                    continue; 
+                }
+            } else if source_id == 1 {
+                // A reunião SÓ funciona se você NÃO estiver falando e o Espaço NÃO estiver apertado
+                let user_active = now < last_mic + 800 || ptt; 
+                let tts_active = now < last_tts + 2500; 
+                if user_active || tts_active {
+                    continue; 
+                }
+            }
+            
+            let state = &mut states[source_id];
+            let mut sum_squares = 0.0;
+            for &s in &samples { sum_squares += s * s; }
+            let rms = (sum_squares / samples.len() as f32).sqrt();
+            let mut is_speaking = rms > silence_threshold;
 
-                    recording_buffer.clear();
-                    last_diarization_len = 0;
-                    last_partial_len = 0;
-                    is_recording = false;
+            if source_id == 0 {
+                is_speaking = ptt; // No PTT estrito, o botão manda
+            }
 
-                    // Reseta os estados preditivos para a próxima frase não sofrer vazamento
-                    vad.reset_states();
-                    diarizer.reset_history();
+            if is_speaking {
+                state.silence_frames = 0;
+                if source_id == 0 {
+                    last_mic_vad.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+                
+                if !state.is_recording {
+                    state.is_recording = true;
+                    state.recording_buffer.clear();
+                    state.partial_timer = 0;
+                }
+            } else {
+                state.silence_frames += 1;
+            }
+
+            if state.is_recording {
+                state.recording_buffer.extend(&samples);
+                state.partial_timer += 1;
+                if state.partial_timer >= 25 {
+                    if state.recording_buffer.len() > 3200 {
+                        let _ = tx_whisper.send((source_id, false, state.recording_buffer.clone()));
+                    }
+                    state.partial_timer = 0;
+                }
+                if state.recording_buffer.len() >= 16000 * 15 {
+                    let _ = tx_whisper.send((source_id, true, state.recording_buffer.clone()));
+                    state.recording_buffer.clear();
+                    state.is_recording = false;
+                } else if state.silence_frames > silence_max_frames {
+                    if state.recording_buffer.len() > 8000 { 
+                        let _ = tx_whisper.send((source_id, true, state.recording_buffer.clone()));
+                    }
+                    state.recording_buffer.clear();
+                    state.is_recording = false;
                 }
             }
         }
     });
 
+    // Bridge WebSocket (Whisper Python)
     tokio::spawn(async move {
-        // Tenta conectar ao microserviço Python de Transcrição.
-        // Se a conexão cair, reconecta automaticamente sem perder o loop de ASR.
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-
-        println!("[WHISPER] Aguardando serviço Python local (127.0.0.1:8000)...");
-
-        'whisper_bridge: loop {
+        loop {
+            println!("[DEBUG] Tentando conectar ao servidor Python...");
             let stream = loop {
                 match connect_async("ws://127.0.0.1:8000").await {
                     Ok((stream, _)) => {
-                        println!("\x1b[32m[✓]\x1b[0m Conectado ao Whisper Python WS!");
                         break stream;
-                    }
-                    Err(_) => {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    }
+                    },
+                    Err(_) => tokio::time::sleep(tokio::time::Duration::from_secs(2)).await,
                 }
             };
-
             let (mut ws_sender, mut ws_receiver) = stream.split();
             let tx_tts_clone = tx_tts.clone();
-
-            // Task para RECEBER dados do Python simultaneamente
+            let ptt_ws_loop = ptt_ws.clone();
             let rx_task = tokio::spawn(async move {
-                while let Some(msg_result) = ws_receiver.next().await {
-                    match msg_result {
-                        Ok(Message::Text(txt)) => {
-                            // Rust só imprime o JSON cru agora porque o launcher GUI parseia.
-                            println!("\n\x1b[35m[AÇÃO PYTHON]\x1b[0m {}", txt);
+                while let Some(Ok(msg)) = ws_receiver.next().await {
+                    if let Message::Binary(bin) = msg {
+                        if bin.len() >= 5 && bin[0] == 2 {
+                            let sr = u32::from_le_bytes([bin[1], bin[2], bin[3], bin[4]]);
+                            let mut tts_audio = Vec::with_capacity(bin[5..].len() / 4);
+                            for chunk in bin[5..].chunks_exact(4) {
+                                tts_audio.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                            }
+                            let _ = tx_tts_clone.send((sr, tts_audio));
                         }
-                        Ok(Message::Binary(bin)) => {
-                            // 0x02 = TTS Audio PCM
-                            if bin.len() >= 5 && bin[0] == 2 {
-                                let sr = u32::from_le_bytes([bin[1], bin[2], bin[3], bin[4]]);
-                                let audio_bytes = &bin[5..];
-                                let mut tts_audio = Vec::with_capacity(audio_bytes.len() / 4);
-                                for chunk in audio_bytes.chunks_exact(4) {
-                                    let val = f32::from_le_bytes([
-                                        chunk[0], chunk[1], chunk[2], chunk[3],
-                                    ]);
-                                    tts_audio.push(val);
-                                }
-                                let _ = tx_tts_clone.send((sr, tts_audio));
+                    } else if let Message::Text(txt) = msg {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&txt) {
+                            if json["command"] == "set_ptt" {
+                                let val = json["value"].as_bool().unwrap_or(false);
+                                ptt_ws_loop.store(val, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
-                        Ok(Message::Close(_)) => break,
-                        _ => {}
                     }
                 }
             });
-
-            while let Some((speaker_id, is_final, audio_data)) = rx_whisper.recv().await {
-                let mut byte_data: Vec<u8> = vec![if is_final { 1 } else { 0 }];
-                byte_data.extend(audio_data.iter().flat_map(|&f| f.to_le_bytes()));
-
-                if let Err(e) = ws_sender.send(Message::Binary(byte_data.into())).await {
-                    eprintln!(
-                        "[WHISPER] Erro ao enviar áudio: {}. Tentando reconectar...",
-                        e
-                    );
-                    break;
-                }
+            while let Some((sid, is_f, data)) = rx_whisper.recv().await {
+                let mut p = vec![sid as u8, if is_f {1} else {0}];
+                p.extend(data.iter().flat_map(|&f| f.to_le_bytes()));
+                if ws_sender.send(Message::Binary(p.into())).await.is_err() { break; }
             }
-
             rx_task.abort();
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            continue 'whisper_bridge;
         }
     });
 
     let rb = HeapRb::<f32>::new(native_sr as usize * 2);
-    let (mut prod, mut cons) = rb.split();
-
-    // Buffer para Áudio Sintetizado (TTS)
-    // 15 segundos para comportar frases longas traduzidas chegando antes do áudio tocar
+    let (mut prod, mut _cons) = rb.split();
     let tts_rb = HeapRb::<f32>::new(out_config.sample_rate.0 as usize * 15);
     let (mut tts_prod, mut tts_cons) = tts_rb.split();
     let out_sr = out_config.sample_rate.0 as f32;
 
-    // Resampling ingênuo e ingestão de TTS em Thread Separada
+    let last_tts_prod = last_tts_now.clone();
     thread::spawn(move || {
         while let Ok((sr, tts_audio)) = rx_tts.recv() {
-            let sample_step = sr as f32 / out_sr;
-            let mut current_pos = 0.0f32;
-            let len = tts_audio.len();
-
-            while (current_pos as usize) < len {
-                let idx = current_pos as usize;
-
-                // Spin-lock amigável se o buffer encher
-                while tts_prod.is_full() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                let _ = tts_prod.push(tts_audio[idx]);
-
-                current_pos += sample_step;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            last_tts_prod.store(now, std::sync::atomic::Ordering::Relaxed);
+            
+            let step = sr as f32 / out_sr;
+            let mut pos = 0.0f32;
+            while (pos as usize) < tts_audio.len() {
+                while tts_prod.is_full() { thread::sleep(Duration::from_millis(5)); }
+                let _ = tts_prod.push(tts_audio[pos as usize]);
+                pos += step;
+                // Atualiza o timestamp continuamente enquanto o áudio entra no pipe
+                let now_loop = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                last_tts_prod.store(now_loop, std::sync::atomic::Ordering::Relaxed);
             }
         }
     });
 
-    let mut chunk_collector = Vec::with_capacity(512);
-    let sample_step = native_sr as f32 / 16000.0;
-    let mut current_pos = 0.0f32;
-    let mut _debug_frames_captured = 0;
+    let mut chunk_mic = Vec::with_capacity(512);
+    let mut chunk_lb = Vec::with_capacity(512);
 
+    let tx_mic = tx.clone();
     let input_stream = mic.build_input_stream(
         &config,
         move |data: &[f32], _| {
-            _debug_frames_captured += 1;
-            if _debug_frames_captured % 100 == 0 {
-                // Imprime a cada ~1-2 segundos apenas para provar que a thread sobreviveu
-                println!(
-                    "[DEBUG] Capturados {} blocos do microfone",
-                    _debug_frames_captured
-                );
-            }
-
+            let mut collector = 0.0;
+            let mut count = 0;
             for frame in data.chunks(in_channels) {
-                let mono_s = frame[0]; // Pega apenas um canal (mono)
-                df_buffer.push(mono_s);
-
-                if df_buffer.len() >= df_size {
-                    // OTIMIZAÇÃO DE CPU: Ignorar o modelo de ruído se o quadro for de silêncio absoluto.
-                    // Isso poupa inferências ONNX custosas (100x por segundo) quando não há som.
-                    let max_amp = df_buffer.iter().copied().fold(0.0f32, f32::max);
-                    let min_amp = df_buffer.iter().copied().fold(0.0f32, f32::min);
-                    let is_silent = (max_amp - min_amp) < 0.005;
-
-                    if !is_silent {
-                        denoiser.process_frame(&mut df_buffer);
+                let s = frame[0];
+                let _ = prod.push(s);
+                collector += s;
+                count += 1;
+                if count >= 3 {
+                    chunk_mic.push(collector / 3.0);
+                    collector = 0.0;
+                    count = 0;
+                    if chunk_mic.len() >= 512 {
+                        let _ = tx_mic.send((0, chunk_mic.clone()));
+                        chunk_mic.clear();
                     }
-
-                    for &clean_s in &df_buffer {
-                        let _ = prod.push(clean_s);
-
-                        // 2. Coleta para a IA (Resampling simplificado)
-                        current_pos += 1.0;
-                        if current_pos >= sample_step {
-                            chunk_collector.push(clean_s);
-                            current_pos -= sample_step; // Subtrai em vez de zerar
-
-                            if chunk_collector.len() >= 512 {
-                                // FORÇAR ENVIO: O Rio agora deságua na IA
-                                if let Err(e) = tx.send(chunk_collector.clone()) {
-                                    eprintln!("Erro ao enviar chunk para IA: {}", e);
-                                }
-                                chunk_collector.clear();
-                            }
-                        }
-                    }
-                    df_buffer.clear();
                 }
             }
         },
@@ -333,44 +315,64 @@ pub fn start_bridge() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
+    let last_tts_lb = last_tts_now.clone();
+    let last_tts_out = last_tts_now.clone();
+
+    let _stream_lb = if let Some(dev) = loopback_dev {
+        let lb_config: cpal::StreamConfig = dev.default_input_config()?.into();
+        let lb_channels = lb_config.channels as usize;
+        let tx_lb = tx.clone();
+        Some(dev.build_input_stream(
+            &lb_config,
+            move |data: &[f32], _| {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                let last = last_tts_lb.load(std::sync::atomic::Ordering::Relaxed);
+                let mute = now < last + 2500; // Mudo por 2.5s para garantir limpeza total do cabo virtual
+                
+                let mut col = 0.0;
+                let mut cnt = 0;
+                for f in data.chunks(lb_channels) {
+                    let s = if mute { 0.0 } else { f[0] };
+                    col += s;
+                    cnt += 1;
+                    if cnt >= 3 {
+                        chunk_lb.push(col / 3.0);
+                        col = 0.0;
+                        cnt = 0;
+                        if chunk_lb.len() >= 512 {
+                            let _ = tx_lb.send((1, chunk_lb.clone()));
+                            chunk_lb.clear();
+                        }
+                    }
+                }
+            },
+            |e| eprintln!("Erro Loopback: {}", e),
+            None,
+        )?)
+    } else { None };
+
     let output_stream = out.build_output_stream(
         &out_config,
         move |data: &mut [f32], _| {
+            let mut playing = false;
             for frame in data.chunks_mut(out_channels) {
-                // Remove o áudio do microfone mas contunua lendo para não estourar o buffer
-                let _mic_val = cons.pop().unwrap_or(0.0);
-
-                // Pega o áudio falado gerado pelo Piper
-                let tts_val = tts_cons.pop().unwrap_or(0.0);
-
-                // O Google Meet vai escutar APENAS a IA traduzida,
-                // para evitar que o cancelamento de eco corte a chamada!
-                for s in frame {
-                    *s = tts_val;
-                }
+                let s = tts_cons.pop().unwrap_or(0.0);
+                if s.abs() > 0.0001 { playing = true; }
+                for sample in frame { *sample = s; }
+            }
+            if playing {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                last_tts_out.store(now, std::sync::atomic::Ordering::Relaxed);
             }
         },
-        |e| eprintln!("Erro Saída: {}", e),
+        |e| eprintln!("Erro Output: {}", e),
         None,
     )?;
 
     input_stream.play()?;
     output_stream.play()?;
+    if let Some(ref s) = _stream_lb { s.play()?; }
 
-    println!("\n[VIVO] Voxly: {}Hz nativos.", native_sr);
-
-    // Mantém os streams vivos sem depender de stdin.
-    // Isso evita encerramento prematuro quando iniciado por launchers GUI.
-    let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
-    let _ = shutdown_rx.recv();
-
-    // Mantém os streams vivos enquanto o processo estiver rodando.
-    // Evita depender de stdin, que pode estar fechado quando o app é
-    // iniciado por launchers GUI (causando encerramento imediato).
-    loop {
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    #[allow(unreachable_code)]
-    Ok(())
+    println!("[IA] Motores ativos. Arquitetura Dual VAD (Eu + Reunião)...");
+    loop { tokio::time::sleep(Duration::from_millis(1000)).await; }
 }

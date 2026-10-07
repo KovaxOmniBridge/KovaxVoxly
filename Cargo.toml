@@ -12,18 +12,12 @@ ringbuf = "0.3"
 tokio = { version = "1", features = ["full"] }
 tempfile = "3.10"
 
-# Inteligência Artificial (ONNX Runtime)
-# Nota: A feature "ndarray" permite que a IA leia os buffers do Rust
-ort = { version = "2.0.0-rc.0", features = ["ndarray"] }
+# CLI e JSON
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
-# Processamento Numérico
-# Alinhado com a versão que o 'ort' e 'deep_filter' costumam usar
-ndarray = "0.15"
-
-# Supressão de Ruído Profissional
-deep_filter = "0.2"
-
-# Gerenciamento de Registro (para o driver.rs não pedir Admin toda vez)
+# Gerenciamento de Registro
 winreg = "0.11"
 hound = "3.5.1"
 crossterm = "0.29.0"

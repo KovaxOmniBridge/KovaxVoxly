@@ -1,519 +1,722 @@
 import json
 import os
+import sys
 import queue
 import re
 import subprocess
 import threading
 import tkinter as tk
+import typing
+import time
 from pathlib import Path
 from tkinter import ttk, scrolledtext
+import customtkinter as ctk
 
-LANGMAP = {
-    "Português": "por_Latn",
-    "Inglês": "eng_Latn",
-    "Espanhol": "spa_Latn",
-    "Francês": "fra_Latn",
-    "Alemão": "deu_Latn",
-    "Italiano": "ita_Latn",
-}
-
-
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
 
 def _resolve_voxly_root() -> Path:
+    # 1. Tenta env var
     env_root = os.environ.get("VOXLY_ROOT")
     if env_root:
         p = Path(env_root).resolve()
-        if (p / "Cargo.toml").exists():
-            return p
+        return p
 
+    # 2. Se estiver congelado (PyInstaller)
+    if getattr(sys, 'frozen', False):
+        exe_path = Path(sys.executable).resolve()
+        if exe_path.parent.name.lower() == "bridge":
+            return exe_path.parent.parent
+        return exe_path.parent
+
+    # 3. Rodando como Script
     here = Path(__file__).resolve().parent
-    if (here / "Cargo.toml").exists():
-        return here
-
-    cwd = Path.cwd().resolve()
-    if (cwd / "Cargo.toml").exists():
-        return cwd
-
     return here
 
-
+# --- DEFINIÇÃO DE ROOT E CARREGAMENTO DE DADOS ---
 ROOT = _resolve_voxly_root()
-VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
-TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
+
+LANGUAGES_DATA_PATH = ROOT / "data" / "languages_data.json"
+
+def load_languages_data():
+    if not LANGUAGES_DATA_PATH.exists():
+        return [], {}, {}
+    try:
+        data = json.loads(LANGUAGES_DATA_PATH.read_text(encoding="utf-8"))
+        lang_list = [l["name"] for l in data]
+        lang_map = {l["name"]: {"nllb": l["nllb"], "whisper": l["whisper"], "piper": l["piper"]} for l in data}
+        voice_map = {l["name"]: l["voices"] for l in data if l["voices"]}
+        return lang_list, lang_map, voice_map
+    except Exception as e:
+        print(f"Erro ao carregar dados de idiomas: {e}")
+        return ["Português (Brasil)"], {"Português (Brasil)": {"nllb": "por_Latn", "whisper": "pt", "piper": "pt_BR"}}, {"Português (Brasil)": ["Faber (Masculino)"]}
+
+LANG_LIST, LANG_MAP_FULL, VOICE_MAP_FULL = load_languages_data()
+
+# --- CAMINHOS ---
+IS_FROZEN = getattr(sys, 'frozen', False)
+
+if IS_FROZEN:
+    VENV_PYTHON = None
+    TRANSCRIBER_EXE = ROOT / "bridge" / "transcriber.exe"
+    VOXLY_EXE = ROOT / "Voxly.exe"
+else:
+    VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+    TRANSCRIBER = ROOT / "bridge" / "transcriber.py"
+    VOXLY_EXE = None
+
 TRANSCRIPT_LOG = ROOT / "data" / "transcricoes_voxly.log"
 TRANSCRIPTION_FEED = ROOT / "data" / "transcricoes_feed.json"
 VOXLY_CONFIG = ROOT / "voxly_config.json"
 PYTHON_LOG = ROOT / "data" / "python_last_run.log"
 RUST_LOG = ROOT / "data" / "rust_last_run.log"
 
-
-TRANSCRIPTION_REGEX = re.compile(r"Locutor\s*(\d+)\]\s*(.+)$", re.IGNORECASE)
-PYTHON_TRANSCRIPTION_REGEX = re.compile(r"\[TRANSCRIÇÃO\]\s*\([^)]*\)\s*->\s*'(.+)'$", re.IGNORECASE)
+TRANSCRIPTION_REGEX = re.compile(r"\[TRANS\]\s*(.*)$", re.IGNORECASE)
 ANSI_ESCAPE_REGEX = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 RUST_READY_REGEX = re.compile(r"\[IA\].*Motores ativos", re.IGNORECASE)
 
 
-class VoxlyLauncherUI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Voxly Launcher")
-        self.root.geometry("1100x720")
-        self.root.minsize(900, 600)
+class VoxlyLauncherUI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Voxly Inicializando...")
+        
+        # Centralizar
+        w, h = 900, 600
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f'{w}x{h}+{x}+{y}')
 
-        self.python_proc: subprocess.Popen | None = None
-        self.rust_proc: subprocess.Popen | None = None
-        self.events: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self.python_proc: typing.Any = None
+        self.rust_proc: typing.Any = None
+        self.events: "queue.Queue[tuple[str, typing.Any]]" = queue.Queue()
+        
         self.running = False
         self._received_transcription = False
         self._feed_last_event_id = 0
         self._feed_last_mtime = 0.0
         self._last_partial_text = ""
+        self._main_ui_active = False
+        self._hardware_devices = {"inputs": ["Padrão"], "outputs": ["Padrão"]}
 
-        self.status_var = tk.StringVar(value="Pronto para iniciar")
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(100, self._drain_events)
+        self.status_var = ctk.StringVar(value="Preparando inicialização automática...")
+        
+        # Lê config atual
+        self.config_data = {}
+        if VOXLY_CONFIG.exists():
+            try:
+                self.config_data = json.loads(VOXLY_CONFIG.read_text("utf-8"))
+            except: pass
 
-    def _build_ui(self) -> None:
-        top = tk.Frame(self.root, padx=12, pady=12)
-        top.pack(fill=tk.X)
+        # UI Elements
+        self.btn_exit_splash: typing.Any = None
+        self.input_lang_combo: typing.Any = None
+        self.output_lang_combo: typing.Any = None
+        self.voice_combo: typing.Any = None
+        self.speed_scale: typing.Any = None
+        self.status_lbl: typing.Any = None
+        self.original_text: typing.Any = None
+        self.translation_text: typing.Any = None
+        self.subtitle_text: typing.Any = None
+        self.progress: typing.Any = None
+        self.splash_log_py: typing.Any = None
+        self.splash_log_rust: typing.Any = None
+        
+        self.current_frame = None
 
-        tk.Label(top, text="Voxly - Inicialização Automática", font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Decide qual tela iniciar
+        if "performance_profile" not in self.config_data:
+            self._build_setup_ui()
+        else:
+            self._build_login_ui()
+            
+    def _clear_window(self):
+        if self.current_frame:
+            self.current_frame.destroy()
+        for widget in self.winfo_children(): 
+            widget.destroy()
 
-        self.start_button = tk.Button(top, text="Iniciar tudo", command=self.start_all, width=20)
-        self.start_button.pack(side=tk.RIGHT, padx=6)
+    def _build_setup_ui(self):
+        self._clear_window()
+        self.title("Voxly - Perfil de Desempenho")
+        
+        self.current_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.current_frame.pack(fill=ctk.BOTH, expand=True, padx=40, pady=40)
+        
+        ctk.CTkLabel(self.current_frame, text="Bem-vindo ao Voxly", font=ctk.CTkFont(size=32, weight="bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(self.current_frame, text="Para a melhor experiência, selecione o perfil de hardware do seu computador:", font=ctk.CTkFont(size=14), text_color="gray").pack(pady=(0, 40))
+        
+        cards_frame = ctk.CTkFrame(self.current_frame, fg_color="transparent")
+        cards_frame.pack(fill=ctk.X, pady=10)
+        
+        def set_profile(level, model):
+            self.config_data["performance_profile"] = level
+            self.config_data["whisper_model"] = model
+            VOXLY_CONFIG.write_text(json.dumps(self.config_data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._build_login_ui()
 
-        self.stop_button = tk.Button(top, text="Parar", command=self.stop_all, width=20, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.RIGHT)
+        # Médio (Agora o novo Mínimo Profissional)
+        c2 = ctk.CTkFrame(cards_frame)
+        c2.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True, padx=20)
+        ctk.CTkLabel(c2, text="Médio Desempenho", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(20, 5))
+        ctk.CTkLabel(c2, text="Padrão Profissional.\nEquilíbrio entre velocidade e precisão.\n\n• CPU: Core i5 / Ryzen 5\n• RAM: 8GB\n• Tradutor: NLLB 1.3B", text_color="gray").pack(pady=10)
+        ctk.CTkButton(c2, text="Selecionar Médio", command=lambda: set_profile("med", "small")).pack(pady=20)
 
-        status = tk.Label(self.root, textvariable=self.status_var, anchor="w", fg="#0f5132", padx=12)
-        status.pack(fill=tk.X)
+        # Alto
+        c3 = ctk.CTkFrame(cards_frame)
+        c3.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True, padx=20)
+        ctk.CTkLabel(c3, text="Alto Desempenho", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(20, 5))
+        ctk.CTkLabel(c3, text="Qualidade Máxima.\nPara usuários que exigem perfeição.\n\n• CPU: Core i7 / Ryzen 7+\n• RAM: 16GB+\n• Tradutor: NLLB 3.3B", text_color="gray").pack(pady=10)
+        ctk.CTkButton(c3, text="Selecionar Alto", fg_color="#27ae60", hover_color="#2ecc71", command=lambda: set_profile("max", "medium")).pack(pady=20)
 
-        center = tk.LabelFrame(self.root, text="Transcrição e Tradução (tempo real)", padx=8, pady=8)
-        center.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8, 6))
+    def _build_login_ui(self):
+        self._clear_window()
+        self.title("Voxly - Login")
+        
+        self.current_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.current_frame.pack(fill=ctk.BOTH, expand=True, padx=40, pady=40)
+        
+        login_box = ctk.CTkFrame(self.current_frame, width=400, corner_radius=15)
+        login_box.pack(expand=True)
+        
+        ctk.CTkLabel(login_box, text="Entrar", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(30, 20))
+        
+        entry_user = ctk.CTkEntry(login_box, placeholder_text="Email de Usuário", width=250)
+        entry_user.pack(pady=10)
+        
+        entry_pass = ctk.CTkEntry(login_box, placeholder_text="Senha", show="*", width=250)
+        entry_pass.pack(pady=10)
+        
+        def do_login():
+            # Transição Imediata para não dar sensação de atraso
+            self._build_splash_ui()
+            self.status_var.set("Iniciando Verificação de Áudio...")
+            
+            def bg_discovery():
+                try:
+                    self._discover_hardware()
+                except Exception as e:
+                    print(f"[!] Erro crítico na descoberta: {e}")
+                finally:
+                    # Garante que SEMPRE continue a inicialização, mesmo se a busca falhar
+                    self.after(100, self.start_all)
+                    self.after(200, self._drain_events)
+                
+            threading.Thread(target=bg_discovery, daemon=True).start()
+            
+        ctk.CTkButton(login_box, text="Acessar Voxly", width=250, command=do_login).pack(pady=(20, 10))
 
-        lang_frame = tk.Frame(center)
-        lang_frame.pack(fill=tk.X, pady=(0, 6))
+        def change_hardware():
+            if "performance_profile" in self.config_data:
+                del self.config_data["performance_profile"]
+                if VOXLY_CONFIG.exists():
+                    VOXLY_CONFIG.write_text(json.dumps(self.config_data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._build_setup_ui()
+            
+        ctk.CTkButton(login_box, text="Trocar Perfil de Hardware", fg_color="transparent", text_color="gray", width=250, command=change_hardware).pack(pady=(0, 20))
 
-        tk.Label(lang_frame, text="Falar em (Entrada):", font=("Segoe UI", 10)).pack(side=tk.LEFT)
-        self.input_lang_combo = ttk.Combobox(lang_frame, values=list(LANGMAP.keys()), state="readonly", width=15)
-        self.input_lang_combo.set("Português")
-        self.input_lang_combo.pack(side=tk.LEFT, padx=(4, 20))
-        self.input_lang_combo.bind("<<ComboboxSelected>>", self._save_config)
+    def _discover_hardware(self):
+        """Executa o motor Rust em modo de listagem para descobrir dispositivos."""
+        try:
+            # 1. Limpeza de processos zumbis que travam o binário (os error 5)
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/IM", "Voxly.exe", "/T"], 
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            
+            # 2. Caminho do Binário em Desenvolvimento vs Produção
+            if IS_FROZEN:
+                cmd = [str(VOXLY_EXE), "--list-devices"]
+            else:
+                debug_exe = ROOT / "target" / "debug" / "Voxly.exe"
+                if not debug_exe.exists():
+                    self.status_var.set("Compilando motor de áudio (Pode demorar 1-2 min)...")
+                    subprocess.run(["cargo", "build", "--quiet"], cwd=ROOT, check=True)
+                
+                self.status_var.set("Sondando dispositivos de áudio...")
+                cmd = [str(debug_exe), "--list-devices"]
 
-        tk.Label(lang_frame, text="Traduzir para (Saída):", font=("Segoe UI", 10)).pack(side=tk.LEFT)
-        self.output_lang_combo = ttk.Combobox(lang_frame, values=list(LANGMAP.keys()), state="readonly", width=15)
-        self.output_lang_combo.set("Inglês")
-        self.output_lang_combo.pack(side=tk.LEFT, padx=(4, 20))
-        self.output_lang_combo.bind("<<ComboboxSelected>>", self._save_config)
+            pf = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            out = subprocess.check_output(cmd, cwd=ROOT, stderr=subprocess.STDOUT, text=True, encoding="utf-8", creationflags=pf, timeout=5)
+            
+            # 3. Parse do JSON de hardware
+            for line in out.splitlines():
+                if line.strip().startswith("{") and "inputs" in line:
+                    data = json.loads(line)
+                    self._hardware_devices["inputs"] = ["Padrão"] + sorted(list(set(data.get("inputs", []))))
+                    self._hardware_devices["outputs"] = ["Padrão"] + sorted(list(set(data.get("outputs", []))))
+                    break
+        except subprocess.TimeoutExpired:
+            print("[!] Timeout ao descobrir hardware (5s). Usando Padrão.")
+        except Exception as e:
+            print(f"[!] Erro ao descobrir hardware: {e}")
+            self._hardware_devices = {"inputs": ["Padrão"], "outputs": ["Padrão"]}
 
+    def _build_splash_ui(self) -> None:
+        self._clear_window()
+        self.title("Voxly Inicializando Motores...")
+        
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill=ctk.BOTH, expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(frame, text="VOXLY", font=ctk.CTkFont(size=36, weight="bold"), text_color="#ff9999").pack(pady=(10, 0))
+        ctk.CTkLabel(frame, text="IA VOICE CONTROL", font=ctk.CTkFont(size=14, weight="bold"), text_color="gray").pack(pady=(0, 10))
+        
+        self.progress = ctk.CTkProgressBar(frame, mode='determinate', width=600)
+        self.progress.set(0)
+        self.progress.pack(pady=(20, 10))
+        
+        ctk.CTkLabel(frame, textvariable=self.status_var, font=ctk.CTkFont(size=12), text_color="gray").pack()
+        
+        logs_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        logs_frame.pack(fill=ctk.BOTH, expand=True, pady=15)
+        
+        # Python Log
+        py_frame = ctk.CTkFrame(logs_frame)
+        py_frame.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True, padx=(0, 10))
+        ctk.CTkLabel(py_frame, text="Servidor Python", font=ctk.CTkFont(size=12, weight="bold")).pack(pady=5)
+        self.splash_log_py = ctk.CTkTextbox(py_frame, font=ctk.CTkFont(family="Consolas", size=11), text_color="#00fa9a")
+        self.splash_log_py.pack(fill=ctk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.splash_log_py.configure(state="disabled")
+        
+        # Rust Log
+        rs_frame = ctk.CTkFrame(logs_frame)
+        rs_frame.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True, padx=(10, 0))
+        ctk.CTkLabel(rs_frame, text="Motor de Áudio Rust", font=ctk.CTkFont(size=12, weight="bold")).pack(pady=5)
+        self.splash_log_rust = ctk.CTkTextbox(rs_frame, font=ctk.CTkFont(family="Consolas", size=11), text_color="#ff79c6")
+        self.splash_log_rust.pack(fill=ctk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.splash_log_rust.configure(state="disabled")
+        
+        self.btn_exit_splash = ctk.CTkButton(frame, text="Cancelar Inicialização", fg_color="transparent", border_width=1, hover_color="#333", command=self.on_close)
+        self.btn_exit_splash.pack(side=ctk.BOTTOM, pady=10)
+
+    def _transition_to_main_ui(self):
+        if self._main_ui_active: return
+        self._main_ui_active = True
+        self._clear_window()
+        
+        self.title("Voxly Voice Control")
+        self.minsize(900, 600)
+        w, h = 1100, 750
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f'{w}x{h}+{x}+{y}')
+        self._build_main_ui()
+        
+        # Teclas de Atalho (Space para PTT)
+        self.bind("<KeyPress-space>", self._on_ptt_press)
+        self.bind("<KeyRelease-space>", self._on_ptt_release)
+
+    def _build_main_ui(self) -> None:
+        self.current_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.current_frame.pack(fill=ctk.BOTH, expand=True)
+
+        top = ctk.CTkFrame(self.current_frame, fg_color="#1e272e" if ctk.get_appearance_mode() == "Dark" else "#353b48", corner_radius=0)
+        top.pack(fill=ctk.X)
+        ctk.CTkLabel(top, text="🎙️ Voxly AI", font=ctk.CTkFont(size=20, weight="bold"), text_color="white").pack(side=ctk.LEFT, padx=20, pady=15)
+        
+        # Botão de Ajuda
+        def show_help():
+            help_win = ctk.CTkToplevel(self)
+            help_win.title("Guia de Configuração Voxly")
+            help_win.geometry("600x550")
+            help_win.after(200, lambda: help_win.focus()) # Garante foco no Windows
+            
+            content = ctk.CTkTextbox(help_win, font=ctk.CTkFont(size=14), wrap="word")
+            content.pack(fill=ctk.BOTH, expand=True, padx=20, pady=20)
+            
+            msg = """❓ GUIA DE CONFIGURAÇÃO VOXLY
+
+Este guia explica como configurar o Voxly para uma experiência profissional em reuniões.
+
+--------------------------------------------------
+🛠️ SELEÇÃO DE DISPOSITIVOS (No Dashboard):
+
+1. MICROFONE (EU): Escolha o seu microfone físico real (ex: headset, condensador). É por aqui que o Voxly ouve você.
+
+2. FONTE DE REUNIÃO (OUTROS): Escolha por onde o som das outras pessoas está saindo. 
+   - Se for 'Padrão', ele tentará captar do Windows.
+   - Recomendado: Se estiver usando VB-Cable, selecione 'CABLE Output'.
+
+3. SAÍDA DE TRADUÇÃO: Escolha para onde a voz traduzida da IA deve ir.
+   - Recomendado: 'CABLE Input'. Isso envia sua tradução para o cabo virtual.
+
+--------------------------------------------------
+🚀 CONFIGURAÇÃO NAS REUNIÕES (Zoom, Meet, Teams):
+
+Para que os outros ouçam sua tradução em vez da sua voz original:
+1. Vá nas configurações de ÁUDIO da sua reunião (Zoom/Meet/etc).
+2. No campo MICROFONE da reunião, selecione: 'CABLE Output (VB-Audio Virtual Cable)'.
+3. No campo ALTO-FALANTE da reunião, selecione seu fone de ouvido normal.
+
+Dessa forma, o Voxly processa seu microfone real e entrega o áudio pronto no Cabo Virtual para a sua reunião!
+"""
+            content.insert("0.0", msg)
+            content.configure(state="disabled")
+            
+            ctk.CTkButton(help_win, text="Entendi!", command=help_win.destroy).pack(pady=(0, 20))
+
+        self.btn_help = ctk.CTkButton(top, text="?", width=30, height=30, corner_radius=15, 
+                                     fg_color="#34495e", hover_color="#3498db", command=show_help)
+        self.btn_help.pack(side=ctk.RIGHT, padx=10)
+        
+        # Theme Switch
+        def change_theme():
+            if theme_switch.get() == 1: ctk.set_appearance_mode("Dark")
+            else: ctk.set_appearance_mode("Light")
+            
+        theme_switch = ctk.CTkSwitch(top, text="Modo Escuro", command=change_theme, onvalue=1, offvalue=0)
+        theme_switch.select() if ctk.get_appearance_mode() == "Dark" else theme_switch.deselect()
+        theme_switch.pack(side=ctk.RIGHT, padx=20)
+        
+        ctk.CTkLabel(top, text="Online e Pronto", font=ctk.CTkFont(size=12, weight="bold"), text_color="#4cd137").pack(side=ctk.RIGHT, padx=10)
+
+        center = ctk.CTkFrame(self.current_frame, fg_color="transparent")
+        center.pack(fill=ctk.BOTH, expand=True, padx=20, pady=15)
+
+        ctrl_frame = ctk.CTkFrame(center, corner_radius=10)
+        ctrl_frame.pack(fill=ctk.X, pady=(0, 15), ipadx=10, ipady=10)
+        
+        ctk.CTkLabel(ctrl_frame, text="Configurações de Voz e Idioma", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor=ctk.W, padx=15, pady=(10,0))
+        
+        grid_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        grid_frame.pack(fill=ctk.X, padx=15, pady=10)
+
+        ctk.CTkLabel(grid_frame, text="Falar em (Entrada):", font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky=ctk.W, pady=(0, 10))
+        self.input_lang_combo = ctk.CTkOptionMenu(grid_frame, values=LANG_LIST, width=250, command=self._save_config)
+        self.input_lang_combo.set(self.config_data.get("input_lang_name", "Português (Brasil)"))
+        self.input_lang_combo.grid(row=0, column=1, padx=(10, 30), pady=(0, 10))
+
+        ctk.CTkLabel(grid_frame, text="Traduzir para (Saída):", font=ctk.CTkFont(size=12)).grid(row=0, column=2, sticky=ctk.W, pady=(0, 10))
+        self.output_lang_combo = ctk.CTkOptionMenu(grid_frame, values=LANG_LIST, width=250, command=self._on_output_lang_change)
+        self.output_lang_combo.set(self.config_data.get("output_lang_name", "Inglês (US)"))
+        self.output_lang_combo.grid(row=0, column=3, padx=10, pady=(0, 10))
+
+        ctk.CTkLabel(grid_frame, text="Voz da IA:", font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky=ctk.W)
+        self.voice_combo = ctk.CTkOptionMenu(grid_frame, width=250, command=self._save_config)
+        self.voice_combo.grid(row=1, column=1, padx=(10, 30))
+
+        ctk.CTkLabel(grid_frame, text="Velocidade:", font=ctk.CTkFont(size=12)).grid(row=1, column=2, sticky=ctk.W)
+        self.speed_scale = ctk.CTkSlider(grid_frame, from_=0.5, to=2.0, number_of_steps=15, command=self._save_config_delayed)
+        self.speed_scale.set(self.config_data.get("tts_speed", 1.2))
+        self.speed_scale.grid(row=1, column=3, padx=10)
+
+        # Seção de Dispositivos de Áudio (Manual)
+        ctk.CTkLabel(ctrl_frame, text="Dispositivos de Áudio (Hardware)", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor=ctk.W, padx=15, pady=(15,0))
+        audio_frame = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        audio_frame.pack(fill=ctk.X, padx=15, pady=10)
+        
+        # Inputs (Mic e Reunião)
+        ctk.CTkLabel(audio_frame, text="Seu Microfone:", font=ctk.CTkFont(size=12)).grid(row=0, column=0, sticky=ctk.W)
+        self.mic_combo = ctk.CTkOptionMenu(audio_frame, values=self._hardware_devices["inputs"], width=350, command=self._save_config)
+        self.mic_combo.set(self.config_data.get("audio_mic", "Padrão"))
+        self.mic_combo.grid(row=0, column=1, padx=10, pady=5)
+
+        ctk.CTkLabel(audio_frame, text="Áudio Reunião:", font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky=ctk.W)
+        self.meeting_combo = ctk.CTkOptionMenu(audio_frame, values=self._hardware_devices["inputs"], width=350, command=self._save_config)
+        self.meeting_combo.set(self.config_data.get("audio_meeting", "Padrão"))
+        self.meeting_combo.grid(row=1, column=1, padx=10, pady=5)
+
+        # Output (Tradução)
+        ctk.CTkLabel(audio_frame, text="Saída Tradução:", font=ctk.CTkFont(size=12)).grid(row=0, column=2, sticky=ctk.W, padx=(20, 0))
+        self.output_dev_combo = ctk.CTkOptionMenu(audio_frame, values=self._hardware_devices["outputs"], width=350, command=self._save_config)
+        self.output_dev_combo.set(self.config_data.get("audio_output", "Padrão"))
+        self.output_dev_combo.grid(row=0, column=3, padx=10, pady=5)
+
+        self.status_lbl = ctk.CTkLabel(center, text="🎙️ Microfone em espera (Segure [ESPAÇO])", font=ctk.CTkFont(size=14, weight="bold"), text_color="#3498db")
+        self.status_lbl.pack(pady=(5, 5))
+
+        # Switch para tradução de entrada
+        self.translate_inbound_var = ctk.BooleanVar(value=self.config_data.get("translate_inbound", True))
+        self.inbound_switch = ctk.CTkSwitch(center, text="Traduzir o que os outros dizem (Reunião)", variable=self.translate_inbound_var, command=self._save_config)
+        self.inbound_switch.pack(pady=(0, 15))
+        
+        self.ptt_indicator = ctk.CTkLabel(center, text="SEGURE [ESPAÇO] PARA FALAR", font=ctk.CTkFont(size=12, weight="bold"), text_color="grey")
+        self.ptt_indicator.pack(pady=(0, 5))
+        
+        self._on_output_lang_change()
+
+        # Painel de Chat Único (Timeline)
+        chat_panel = ctk.CTkFrame(center)
+        chat_panel.pack(fill=ctk.BOTH, expand=True)
+        ctk.CTkLabel(chat_panel, text="Linha do Tempo da Conversa", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor=ctk.W, padx=15, pady=(10, 0))
+        
+        self.chat_feed = ctk.CTkTextbox(chat_panel, font=ctk.CTkFont(size=16), wrap="word")
+        self.chat_feed.pack(fill=ctk.BOTH, expand=True, padx=15, pady=15)
+        self.chat_feed.insert("0.0", "Aguardando áudio...\n")
+        
+        # Configurar Cores (Tags do Tkinter interno)
+        self.chat_feed._textbox.tag_config("me", foreground="#3498db", font=ctk.CTkFont(size=16, weight="bold"))
+        self.chat_feed._textbox.tag_config("them", foreground="#2ecc71", font=ctk.CTkFont(size=16, weight="bold"))
+        self.chat_feed._textbox.tag_config("sub", foreground="grey", font=ctk.CTkFont(size=14))
+        self.chat_feed._textbox.tag_config("dim", foreground="grey")
+        
+        self.chat_feed.configure(state="disabled")
+
+        sub_panel = ctk.CTkFrame(center, height=60)
+        sub_panel.pack(fill=ctk.X, pady=(15, 0))
+        sub_panel.pack_propagate(False)
+        self.subtitle_text = ctk.CTkLabel(sub_panel, text="Voxly Ativo.", font=ctk.CTkFont(size=18, weight="bold"), text_color="#e1b12c")
+        self.subtitle_text.pack(expand=True)
+
+        self._refresh_transcriptions_display()
+
+    def _save_config_delayed(self, _):
+        # Evita salvar intensamente enquanto arrasta o slider
+        if hasattr(self, "_save_timer") and self._save_timer:
+            self.after_cancel(self._save_timer)
+        self._save_timer = self.after(500, self._save_config)
+
+    def _on_output_lang_change(self, event=None) -> None:
+        lang = self.output_lang_combo.get() if self.output_lang_combo else "Inglês (US)"
+        voices = VOICE_MAP_FULL.get(lang, ["Padrão"])
+        if self.voice_combo:
+            self.voice_combo.configure(values=voices)
+            
+            # Se a voz salva não estiver na lista ou o config estiver vazio, usa a primeira
+            saved_voice = self.config_data.get("tts_voice")
+            if saved_voice in voices:
+                self.voice_combo.set(saved_voice)
+            else:
+                self.voice_combo.set(voices[0] if voices else "Padrão")
+                
         self._save_config()
 
-        split_frame = tk.Frame(center)
-        split_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+    def _on_ptt_press(self, event):
+        if not self._main_ui_active or event.widget.winfo_class() == "Entry": return
+        if not hasattr(self, "_ptt_active") or not self._ptt_active:
+            self._ptt_active = True
+            self.status_lbl.configure(text="🔴 TRANSMITINDO AO VIVO", text_color="#e74c3c")
+            self.ptt_indicator.configure(text_color="#e74c3c")
+            self._send_bridge_command({"command": "set_ptt", "value": True})
 
-        # Painel Original
-        orig_panel = tk.LabelFrame(split_frame, text="Original", padx=4, pady=4)
-        orig_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        self.original_text = scrolledtext.ScrolledText(orig_panel, height=8, wrap=tk.WORD, font=("Consolas", 11))
-        self.original_text.pack(fill=tk.BOTH, expand=True)
-        self.original_text.insert(tk.END, "Aguardando fala original...\n")
-        self.original_text.config(state=tk.DISABLED)
+    def _on_ptt_release(self, event):
+        if not self._main_ui_active or event.widget.winfo_class() == "Entry": return
+        self._ptt_active = False
+        self.status_lbl.configure(text="🎙️ Microfone em espera (Segure [ESPAÇO])", text_color="#3498db")
+        self.ptt_indicator.configure(text_color="grey")
+        self._send_bridge_command({"command": "set_ptt", "value": False})
 
-        # Painel Tradução
-        trad_panel = tk.LabelFrame(split_frame, text="Tradução", padx=4, pady=4)
-        trad_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
-        self.translation_text = scrolledtext.ScrolledText(trad_panel, height=8, wrap=tk.WORD, font=("Consolas", 11))
-        self.translation_text.pack(fill=tk.BOTH, expand=True)
-        self.translation_text.insert(tk.END, "Aguardando tradução...\n")
-        self.translation_text.config(state=tk.DISABLED)
-
-        # Painel Legenda (Deitada)
-        sub_panel = tk.LabelFrame(center, text="Legenda ao Vivo (Reunião)", padx=4, pady=4)
-        sub_panel.pack(fill=tk.X)
-        self.subtitle_text = tk.Text(sub_panel, height=3, wrap=tk.WORD, font=("Segoe UI", 16, "bold"), bg="black", fg="yellow")
-        self.subtitle_text.pack(fill=tk.X, expand=True)
-        self.subtitle_text.insert(tk.END, "...")
-        self.subtitle_text.config(state=tk.DISABLED)
-
-        bottom = tk.Frame(self.root, padx=12, pady=8)
-        bottom.pack(fill=tk.BOTH, expand=True)
-
-        left_panel = tk.LabelFrame(bottom, text="Logs Python (Whisper)", padx=6, pady=6)
-        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-
-        right_panel = tk.LabelFrame(bottom, text="Logs Rust (Voxly)", padx=6, pady=6)
-        right_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
-
-        self.python_logs = scrolledtext.ScrolledText(left_panel, wrap=tk.WORD, font=("Consolas", 10))
-        self.python_logs.pack(fill=tk.BOTH, expand=True)
-
-        self.rust_logs = scrolledtext.ScrolledText(right_panel, wrap=tk.WORD, font=("Consolas", 10))
-        self.rust_logs.pack(fill=tk.BOTH, expand=True)
+    def _send_bridge_command(self, cmd_dict):
+        if self.python_proc and self.python_proc.poll() is None:
+            try:
+                msg = json.dumps(cmd_dict) + "\n"
+                self.python_proc.stdin.write(msg)
+                self.python_proc.stdin.flush()
+            except: pass
 
     def _save_config(self, event=None) -> None:
         try:
-            config = {
-                "input_lang_name": self.input_lang_combo.get(),
-                "output_lang_name": self.output_lang_combo.get(),
-                "input_nllb": LANGMAP.get(self.input_lang_combo.get(), "por_Latn"),
-                "output_nllb": LANGMAP.get(self.output_lang_combo.get(), "eng_Latn"),
-            }
-            VOXLY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception as e:
-            print(f"Erro ao salvar config: {e}")
+            in_lang = self.input_lang_combo.get() if self.input_lang_combo else "Português (Brasil)"
+            out_lang = self.output_lang_combo.get() if self.output_lang_combo else "Inglês (US)"
+            speed_val = self.speed_scale.get() if self.speed_scale else 1.2
+            
+            in_data = LANG_MAP_FULL.get(in_lang, {"nllb": "por_Latn", "whisper": "pt", "piper": "pt_BR"})
+            out_data = LANG_MAP_FULL.get(out_lang, {"nllb": "eng_Latn", "whisper": "en", "piper": "en_US"})
+            
+            # Merge com as configurações existentes
+            self.config_data.update({
+                "input_lang_name": in_lang, "output_lang_name": out_lang,
+                "input_nllb": in_data["nllb"], "input_whisper": in_data["whisper"],
+                "output_nllb": out_data["nllb"], "output_piper": out_data["piper"],
+                "tts_voice": self.voice_combo.get() if self.voice_combo else "Padrão",
+                "tts_speed": float(f"{speed_val:.2f}"),
+                "translate_inbound": self.translate_inbound_var.get() if hasattr(self, "translate_inbound_var") else True,
+                "audio_mic": self.mic_combo.get() if hasattr(self, "mic_combo") else "Padrão",
+                "audio_meeting": self.meeting_combo.get() if hasattr(self, "meeting_combo") else "Padrão",
+                "audio_output": self.output_dev_combo.get() if hasattr(self, "output_dev_combo") else "Padrão"
+            })
+            
+            VOXLY_CONFIG.write_text(json.dumps(self.config_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e: 
+            print("Erro ao salvar config:", e)
 
     def start_all(self) -> None:
-        if self.running:
-            return
-
-        if not VENV_PYTHON.exists():
-            self._set_status("Erro: .venv não encontrado. Crie o ambiente virtual antes.", ok=False)
-            return
-
+        if self.running: return
         self.running = True
-        self._received_transcription = False
-        self._feed_last_event_id = 0
-        self._set_transcription_placeholder("Inicializando pipeline...")
-        self._set_transcription_placeholder("Inicializando pipeline...")
-        self.original_text.config(state=tk.NORMAL)
-        self.original_text.delete("1.0", tk.END)
-        self.original_text.insert(tk.END, "Inicializando pipeline...\n")
-        self.original_text.config(state=tk.DISABLED)
-        
-        self.translation_text.config(state=tk.NORMAL)
-        self.translation_text.delete("1.0", tk.END)
-        self.translation_text.insert(tk.END, "Inicializando pipeline...\n")
-        self.translation_text.config(state=tk.DISABLED)
-        
-        self.subtitle_text.config(state=tk.NORMAL)
-        self.subtitle_text.delete("1.0", tk.END)
-        self.subtitle_text.insert(tk.END, "...")
-        self.subtitle_text.config(state=tk.DISABLED)
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        self._set_status("Iniciando serviço Python...", ok=True)
-        
         PYTHON_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(PYTHON_LOG, "w", encoding="utf-8") as f:
-            f.write("=== Inicio do Log Python (TTS/ASR) ===\n")
-        with open(RUST_LOG, "w", encoding="utf-8") as f:
-            f.write("=== Inicio do Log Rust (Voxly Core) ===\n")
-
-        thread = threading.Thread(target=self._start_pipeline, daemon=True)
-        thread.start()
+        with open(PYTHON_LOG, "w", encoding="utf-8") as f: f.write("=== Inicio do Log Python ===\n")
+        with open(RUST_LOG, "w", encoding="utf-8") as f: f.write("=== Inicio do Log Rust ===\n")
+        threading.Thread(target=self._start_pipeline, daemon=True).start()
 
     def _start_pipeline(self) -> None:
         try:
+            self.events.put(("status", "Limpando conexões anteriores..."))
+            self.events.put(("progress", 5))
             env = os.environ.copy()
             env["VOXLY_ROOT"] = str(ROOT)
-
-            self.python_proc = subprocess.Popen(
-                [str(VENV_PYTHON), "-u", str(TRANSCRIBER)],
-                cwd=ROOT,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-            self.events.put(("status", "Python iniciado. Aguardando Whisper carregar..."))
-            python_ready = self._read_until_ready(self.python_proc, "python")
-
-            if not python_ready:
-                self.events.put(("status_error", "Falha ao iniciar Python/Whisper. Veja os logs."))
-                self.stop_all()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            if sys.platform == "win32":
+                try: # Mata porta 8000
+                    out = subprocess.check_output("netstat -ano | findstr :8000", shell=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    for l in out.splitlines():
+                        if "LISTENING" in l: subprocess.run(f"taskkill /F /PID {l.split()[-1]}", shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                except: pass
+            
+            self.events.put(("status", "Iniciando motores de IA (Python)..."))
+            self.events.put(("progress", 10))
+            cmd_py = [str(TRANSCRIBER_EXE)] if IS_FROZEN else [str(VENV_PYTHON), "-u", str(TRANSCRIBER)]
+            pf = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            self.python_proc = subprocess.Popen(cmd_py, cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=pf)
+            if not self._read_until_ready(self.python_proc, "python"): 
+                self.events.put(("status", "ERRO: Falha ao iniciar Python"))
                 return
-
-            self.events.put(("status", "Whisper pronto. Iniciando cargo run..."))
-            self.rust_proc = subprocess.Popen(
-                ["cargo", "run"],
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-
+            
+            self.events.put(("status", "IA Pronta! Iniciando motor de Áudio (Rust)..."))
+            self.events.put(("progress", 70))
+            
+            cmd_rs = [str(VOXLY_EXE)] if IS_FROZEN else [str(ROOT / "target" / "debug" / "Voxly.exe")]
+            
+            # Adiciona argumentos de áudio manual se não for "Padrão"
+            mic = self.config_data.get("audio_mic", "Padrão")
+            if mic != "Padrão": cmd_rs.extend(["--mic", mic])
+            
+            meeting = self.config_data.get("audio_meeting", "Padrão")
+            if meeting != "Padrão": cmd_rs.extend(["--meeting", meeting])
+            
+            out = self.config_data.get("audio_output", "Padrão")
+            if out != "Padrão": cmd_rs.extend(["--output", out])
+            
+            print(f"[*] Iniciando motor Rust: {cmd_rs}")
+            self.rust_proc = subprocess.Popen(cmd_rs, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, creationflags=pf)
+            
+            self.events.put(("status", "Aguardando inicialização final..."))
+            self.events.put(("progress", 90))
             threading.Thread(target=self._stream_logs, args=(self.rust_proc, "rust"), daemon=True).start()
-            self.events.put(("status", "Voxly em execução. Fale no microfone."))
+        except Exception as e:
+            self.events.put(("python", f"[ERRO] {e}\n"))
 
-        except Exception as exc:
-            self.events.put(("python", f"[ERRO] {exc}\n"))
-            self.events.put(("status_error", "Erro ao iniciar pipeline."))
-            self.running = False
-
-    def _read_until_ready(self, proc: subprocess.Popen, origin: str) -> bool:
+    def _read_until_ready(self, proc: typing.Any, origin: str) -> bool:
         while True:
-            line = proc.stdout.readline() if proc.stdout else ""
-            if not line:
-                return proc.poll() is None
+            line = proc.stdout.readline()
+            if not line: return proc.poll() is None
             self.events.put((origin, line))
-            if "Iniciando servidor WebSocket Whisper local na porta" in line:
+            if "Iniciando servidor WebSocket" in line:
                 threading.Thread(target=self._stream_logs, args=(proc, origin), daemon=True).start()
                 return True
 
-    def _stream_logs(self, proc: subprocess.Popen, origin: str) -> None:
-        if not proc.stdout:
-            return
-        for line in proc.stdout:
-            self.events.put((origin, line))
+    def _stream_logs(self, proc: typing.Any, origin: str) -> None:
+        for line in proc.stdout: self.events.put((origin, line))
+        self.events.put((origin, f"\n[FINALIZADO]\n"))
 
-        code = proc.poll()
-        self.events.put((origin, f"\n[PROCESSO FINALIZADO] código={code}\n"))
-
-    def stop_all(self) -> None:
+    def stop_all(self):
         self.running = False
-        self._terminate(self.rust_proc)
-        self._terminate(self.python_proc)
-        self.rust_proc = None
-        self.python_proc = None
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self._received_transcription = False
-        self._set_status("Processos parados.", ok=False)
-
-    def _terminate(self, proc: subprocess.Popen | None) -> None:
-        if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-    def _set_transcription_placeholder(self, text: str) -> None:
-        self.original_text.config(state=tk.NORMAL)
-        self.original_text.delete("1.0", tk.END)
-        self.original_text.insert(tk.END, f"{text}\n")
-        self.original_text.config(state=tk.DISABLED)
-
-    def _persist_transcript_line(self, line: str) -> None:
-        try:
-            TRANSCRIPT_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with TRANSCRIPT_LOG.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-        except OSError as exc:
-            self._set_status(f"Falha ao gravar log local: {exc}", ok=False)
-            with TRANSCRIPT_LOG.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-        except OSError:
-            pass
-
-    def _append(self, widget: scrolledtext.ScrolledText, text: str) -> None:
-        widget.insert(tk.END, text)
-        widget.see(tk.END)
-
-    def _append_transcription(self, speaker: str, text: str) -> None:
-        self.original_text.config(state=tk.NORMAL)
-        if not self._received_transcription:
-            self.original_text.delete("1.0", tk.END)
-            self._received_transcription = True
-        line = f"Locutor {speaker}: {text}"
-        self._append(self.original_text, f"{line}\n")
-        self.original_text.config(state=tk.DISABLED)
-        self._persist_transcript_line(line)
-
-    def _append_transcription_system(self, text: str) -> None:
-        self.original_text.config(state=tk.NORMAL)
-        if not self._received_transcription:
-            self.original_text.delete("1.0", tk.END)
-            self._received_transcription = True
-        line = f"[sistema] {text}"
-        self._append(self.original_text, f"{line}\n")
-        self.original_text.config(state=tk.DISABLED)
-        self._persist_transcript_line(line)
-
-    def _set_status(self, text: str, ok: bool) -> None:
-        self.status_var.set(text)
-
-    def _drain_transcription_feed(self) -> None:
-        if not TRANSCRIPTION_FEED.exists():
-            return
-        
-        try:
-            current_mtime = TRANSCRIPTION_FEED.stat().st_mtime
-            if current_mtime <= self._feed_last_mtime:
-                return
-            self._feed_last_mtime = current_mtime
-            
-            self._feed_last_mtime = current_mtime
-            
-            # Recarrega toda a tela lendo o JSON, para caso alguma tradução assíncrona
-            # tenha terminado e atualizado algum ID antigo no HD.
-            self._refresh_transcriptions_display()
-            
-            # Atualiza o iterador para logs baseados no ID passado
-            payload = json.loads(TRANSCRIPTION_FEED.read_text(encoding="utf-8"))
-            events = payload.get("events", [])
-            for event in events:
-                event_id = event.get("id")
-                if not isinstance(event_id, int) or event_id <= self._feed_last_event_id:
-                    continue
-
-                status = event.get("status", "")
-                text = str(event.get("text", "")).strip()
-                error = str(event.get("error", "")).strip()
-
-                if status == "success" and text:
-                    # Não vamos colocar na fila da interface para evitar prints duplicados
-                    # pois o Rust e o Python já imprimem no stdout nativamente.
-                    pass
-                elif status == "error":
-                    self.events.put(("json_system", f"Erro no ASR (json feed): {error or 'desconhecido'}"))
-
-                self._feed_last_event_id = event_id
-        except (OSError, json.JSONDecodeError):
-            pass
+        for p in [self.rust_proc, self.python_proc]:
+            if p and p.poll() is None:
+                p.terminate()
+                try: p.wait(timeout=3)
+                except: p.kill()
 
     def _refresh_transcriptions_display(self):
-        """Re-renderiza a aba de transcrições lendo as últimas 20 mensagens do JSON.
-        Necessário pois traduções agora são Assíncronas e chegam com delay, 
-        podendo alterar blocos de texto no meio da tela."""
+        if not self._main_ui_active or not TRANSCRIPTION_FEED.exists(): return
         try:
-            feed_path = TRANSCRIPTION_FEED
-            if not feed_path.exists():
-                return
+            with open(TRANSCRIPTION_FEED, "r", encoding="utf-8") as f: data = json.load(f)
             
-            with open(feed_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            self.chat_feed.configure(state='normal')
+            self.chat_feed.delete('0.0', tk.END)
+            
+            evs = data.get("events", [])[-30:]
+            last_msg = ""
+            
+            for ev in evs:
+                st = ev.get("status")
+                t = ev.get("text", "")
+                tr = ev.get("traduction", "")
+                sid = ev.get("source_id", 0)
                 
-            self.original_text.config(state='normal')
-            self.original_text.delete('1.0', tk.END)
-            
-            self.translation_text.config(state='normal')
-            self.translation_text.delete('1.0', tk.END)
-
-            self.subtitle_text.config(state='normal')
-            self.subtitle_text.delete('1.0', tk.END)
-            
-            # Foca apenas nas últimas 25 interações para alta performance
-            events = data.get("events", [])[-25:]
-            last_text = ""
-            last_trad = ""
-            for event in events:
-                status = event.get("status")
-                text = str(event.get("text", "")).strip()
-                trad = str(event.get("traduction", "")).strip()
-
-                if status == "success" and text:
-                    self.original_text.insert(tk.END, f"Locutor 0: {text}\n\n")
-                    if trad:
-                        self.translation_text.insert(tk.END, f"Locutor 0: {trad}\n\n")
-                    else:
-                        self.translation_text.insert(tk.END, f"Locutor 0: [Traduzindo...]\n\n")
+                if st == "success" and t:
+                    icon = "👤 VOCÊ" if sid == 0 else "👥 REUNIÃO"
+                    tag = "me" if sid == 0 else "them"
                     
-                    last_text = text
-                    last_trad = trad
-                elif status == "error":
-                    error = str(event.get("error", "desconhecido")).strip()
-                    self.original_text.insert(tk.END, f"[Erro API] {error}\n\n")
+                    self.chat_feed.insert(tk.END, f"{icon}: ", tag)
+                    self.chat_feed.insert(tk.END, f"{t}\n")
+                    if tr:
+                        self.chat_feed.insert(tk.END, f"   ↳ Tradução: {tr}\n", "sub")
+                    self.chat_feed.insert(tk.END, "\n")
+                    last_msg = tr if tr else f"{icon}: {t}"
             
-            # FASE 3 e 5: Linha Fantasma para ASR Contínuo e Legendas
             if self._last_partial_text:
-                self.original_text.insert(tk.END, f"  [⏳] {self._last_partial_text}...\n")
-                self.subtitle_text.insert(tk.END, f"[⏳] {self._last_partial_text}...")
+                self.chat_feed.insert(tk.END, f"⏳ {self._last_partial_text}...\n", "dim")
+                self.subtitle_text.configure(text=f"Processando: {self._last_partial_text}")
             else:
-                # Se não tem fantasma, a legenda exibe como banner a última tradução (ou texto se ainda em NLLB)
-                display_sub = last_trad if last_trad else last_text
-                if display_sub:
-                    self.subtitle_text.insert(tk.END, display_sub)
+                if last_msg: self.subtitle_text.configure(text=last_msg)
+                
+            self.chat_feed.configure(state='disabled')
+            self.chat_feed.see(tk.END)
             
-            self.original_text.config(state='disabled')
-            self.original_text.see(tk.END)
-            
-            self.translation_text.config(state='disabled')
-            self.translation_text.see(tk.END)
-
-            self.subtitle_text.config(state='disabled')
-            self.subtitle_text.see(tk.END)
-        except Exception as e:
-            print(f"Erro em _refresh_transcriptions_display: {e}")
+        except Exception as e: 
+            print("Erro ao atualizar chat:", e)
 
     def _drain_events(self) -> None:
-        while True:
-            try:
-                target, payload = self.events.get_nowait()
-            except queue.Empty:
-                break
-
-            if target == "python":
-                clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
-                if clean_payload:
-                    self._append(self.python_logs, clean_payload + "\n")
-                    with open(PYTHON_LOG, "a", encoding="utf-8") as f:
-                        f.write(clean_payload + "\n")
+        # Limita o processamento de eventos por ciclo para evitar o "travamento" da UI (bolinha azul)
+        count = 0 
+        while count < 100:
+            count += 1
+            try: target, payload = self.events.get_nowait()
+            except queue.Empty: break
+            
+            # Se for log ou texto, limpa ANSI
+            clean = ""
+            if isinstance(payload, str):
+                clean = ANSI_ESCAPE_REGEX.sub("", payload).strip()
+            
+            if target in ["python", "rust"]:
+                if not clean: continue
+                log = PYTHON_LOG if target == "python" else RUST_LOG
+                try:
+                    with open(log, "a", encoding="utf-8") as f: f.write(clean + "\n")
+                    if not self._main_ui_active:
+                        w = self.splash_log_py if target == "python" else self.splash_log_rust
+                        if w: 
+                            w.configure(state="normal")
+                            w.insert(tk.END, clean + "\n")
+                            if float(w.index(tk.END)) > 500: w.delete("1.0", "2.0") 
+                            w.see(tk.END)
+                            w.configure(state="disabled")
+                        
+                        # Detecção de download de modelos no log para atualizar status visual
+                        if target == "python":
+                            if "fetching" in clean.lower() or "baixando" in clean.lower():
+                                self.status_var.set("📦 Baixando Modelos de IA... (Pode demorar)")
+                                if self.progress: self.progress.set(0.15)
+                            elif "[+] Modelos prontos!" in clean:
+                                self.status_var.set("✅ Modelos Carregados! Iniciando Motor de Áudio...")
+                                if self.progress: self.progress.set(0.60)
+                            elif "[+] Motor Piper TTS Pronto!" in clean:
+                                self.status_var.set("🔊 Áudio TTS Pronto!")
+                                if self.progress: self.progress.set(0.85)
+                except: pass
                 
-                py_match = PYTHON_TRANSCRIPTION_REGEX.search(clean_payload)
-                if py_match:
-                    text = py_match.group(1).strip()
-                    if text:
-                        self._append_transcription("?", text)
-            elif target == "rust":
-                clean_payload = ANSI_ESCAPE_REGEX.sub("", payload).strip()
+                # Se for Log de IA Ativa, muda para UI Principal
+                if target == "rust" and not self._main_ui_active and RUST_READY_REGEX.search(clean): 
+                    self.status_var.set("Motores Prontos! Abrindo interface...")
+                    self._transition_to_main_ui()
+                
+                # Procura por atualizações de transcrição no log
+                m = TRANSCRIPTION_REGEX.search(clean)
+                if m and self._main_ui_active:
+                    try:
+                        d = json.loads(m.group(1).strip())
+                        if d.get("status") == "partial": self._last_partial_text = d.get("text", "")
+                        else: self._last_partial_text = ""
+                        self._refresh_transcriptions_display()
+                    except: pass
+            elif target == "progress" and self.progress: 
+                self.progress.set(min(1.0, payload / 100.0))
+            elif target == "status": self.status_var.set(payload)
+        if self._main_ui_active and TRANSCRIPTION_FEED.exists():
+            mt = TRANSCRIPTION_FEED.stat().st_mtime
+            if mt > self._feed_last_mtime:
+                self._feed_last_mtime = mt
+                self._refresh_transcriptions_display()
 
-                # Ignora a massiva barra de progresso do terminal para impedir o congelamento do Tkinter
-                if "[VAD]" not in clean_payload and clean_payload:
-                    self._append(self.rust_logs, clean_payload + "\n")
-                    with open(RUST_LOG, "a", encoding="utf-8") as f:
-                        f.write(clean_payload + "\n")
+        self.after(50, self._drain_events)
 
-                if not self._received_transcription and RUST_READY_REGEX.search(clean_payload):
-                    self._set_transcription_placeholder("Pipeline pronto. Aguardando fala no microfone...")
-                    
-                match = TRANSCRIPTION_REGEX.search(clean_payload)
-                if match:
-                    speaker, text = match.groups()
-                    text = text.strip()
-                    if text.startswith("{"):
-                        try:
-                            data = json.loads(text)
-                            text = data.get("text", "") # We ignore the local payload in favor of the fresh JSON read
-                            status = data.get("status")
-                            if status == "error":
-                                self.events.put(("status_error", f"ASR retornou erro: {data.get('error', 'desconhecido')}"))
-                                self._append_transcription_system(f"Erro no ASR: {data.get('error', 'desconhecido')}")
-                            elif status == "empty":
-                                pass
-                            elif status == "partial":
-                                self._last_partial_text = text
-                                self._refresh_transcriptions_display()
-                                continue
-                            elif status in ["success", "translation_update"]:
-                                self._last_partial_text = "" # Linha final recebida, apaga a fantasma
-                                # Traduções assíncronas disparam esse recarregamento inteligente na tela Tkinter!
-                                self._refresh_transcriptions_display()
-                                continue # Skippa o insert duplo
-                        except json.JSONDecodeError:
-                            pass
-                    
-                    if text:
-                        self._append_transcription(speaker, text)
-            elif target == "status":
-                self._set_status(payload, ok=True)
-            elif target == "status_error":
-                self._set_status(payload, ok=False)
-            elif target == "json_transcription":
-                self._append_transcription("json", payload)
-            elif target == "json_system":
-                self._append_transcription_system(payload)
-
-        self._drain_transcription_feed()
-        self.root.after(200, self._drain_events)
-
-    def on_close(self) -> None:
-        self.stop_all()
-        self.root.destroy()
-
-
-def main() -> None:
-    app = tk.Tk()
-    VoxlyLauncherUI(app)
-    app.mainloop()
-
+    def on_close(self): self.stop_all(); self.destroy()
 
 if __name__ == "__main__":
-    main()
+    app = VoxlyLauncherUI()
+    app.mainloop()

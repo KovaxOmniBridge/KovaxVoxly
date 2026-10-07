@@ -9,3 +9,23 @@ ENV/
 # Python cache files
 __pycache__/
 *.py[cod]
+
+# Build and Packaging outputs
+build/
+dist/
+Voxly_App_Standalone/
+*.spec
+
+# Log and feed files
+*.log
+data/*.log
+data/transcricoes_feed.json
+data/transcricoes_voxly.log
+
+
+# Local downloaded models & scripts
+models/nllb-*/
+inspect_piper.py
+verify_fix.py
+verify_languages.py
+

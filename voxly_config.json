@@ -1,6 +1,16 @@
 {
-  "input_lang_name": "Português",
-  "output_lang_name": "Inglês",
+  "input_lang_name": "Português (Brasil)",
+  "output_lang_name": "Inglês (US)",
   "input_nllb": "por_Latn",
-  "output_nllb": "eng_Latn"
+  "input_whisper": "pt",
+  "output_nllb": "eng_Latn",
+  "output_piper": "en_US",
+  "tts_voice": "Lessac (Feminino)",
+  "tts_speed": 1.2,
+  "translate_inbound": true,
+  "audio_mic": "Grupo de microfones (Realtek(R) Audio)",
+  "audio_meeting": "CABLE Output (VB-Audio Virtual Cable)",
+  "audio_output": "CABLE Input (VB-Audio Virtual Cable)",
+  "performance_profile": "med",
+  "whisper_model": "small"
 }
