@@ -95,7 +95,7 @@ O Voxly suporta **mais de 90 idiomas** para transcrição e tradução, com supo
 ### 1. Clonar o Repositório
 
 ```bash
-git clone https://github.com/Davi658/Voxly.git
+git clone https://github.com/KovaxOmniBridge/Voxly.git
 cd Voxly
 ```
 
